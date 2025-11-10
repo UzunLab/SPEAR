@@ -1,0 +1,95 @@
+# GRN Pipeline Overview
+
+This document summarizes the current end-to-end workflow for the single-cell gene regulatory network (GRN) regression pipeline so new contributors can onboard quickly before the project is published to GitHub.
+
+## 1. Data Sources and Configuration
+
+- **AnnData inputs:** `combined_ATAC_qc.h5ad` and `combined_RNA_qc.h5ad` (stored in `data/raw/`) are loaded through `PathsConfig.from_base(...)`. Cell barcodes are aligned so paired ATAC/RNA observations remain synchronized.
+- **Reference annotations:** The GTF specified in `config.PathsConfig` (defaults to `data/reference/GCF_000001635.27_genomic.gtf`) provides TSS coordinates used in feature extraction.
+- **Training configuration:** `TrainingConfig` centralizes hyperparameters such as window size (±10 kb), bin size (500 bp), pseudobulk settings (20-cell groups, 10 PCA components), split ratios (70/15/15), history tracking, and group keys. Each CLI run receives a `run_name` so all outputs land in a dedicated directory.
+- **Gene manifests:** Runs optionally accept a newline-delimited manifest (`--gene-manifest`). When present, every model consumes the same ordered gene list; otherwise genes can be filtered by chromosome or count thresholds at runtime.
+
+## 2. Gene Selection Logic
+
+1. Parse the GTF to obtain gene IDs/names and TSS information (respecting chromosome filters or explicit gene lists).
+2. Validate that requested genes exist in the RNA AnnData matrix and meet expression criteria (`min_cells_per_gene`, `min_expression`, `min_expression_fraction`).
+3. Persist selected genes and their expression fractions alongside each run (see `output/results/grn_regression/<run_name>/selected_genes.csv`).
+
+## 3. Feature Construction & Normalization
+
+- **ATAC features:** For every gene we aggregate peak counts within ±10 kb windows around the TSS, binned into 500 bp segments (40 bins by default). Feature matrices are recomputed for each run.
+- **Modal normalization:**
+  - ATAC counts are converted to counts-per-million by default (`training.atac_layer='counts_per_million'`); other transforms such as TF–IDF can be requested via configuration.
+  - RNA counts are converted to log1p CPM (`rna_expression_layer="log1p_cpm"`) unless a precomputed layer already exists and are then standardized with `scanpy.pp.scale` using the same sparse-aware settings.
+- **Optional scalers:** Standard or MinMax scaling can be applied to features and/or targets depending on `TrainingConfig`.
+
+## 4. Pseudobulk Aggregation
+
+To stabilize expression estimates we create pseudobulk observations per split:
+
+1. Compute a PCA embedding (default 10 components) within each split.
+2. For every cell, select same-sample neighbours via `NearestNeighbors` and form groups of up to 20 cells.
+3. Average features/targets inside each group; group labels and synthetic cell IDs (e.g., `train_bulk_00001`) are stored to maintain group-aware splits.
+
+## 5. Model Suite
+
+`ml_grn_pipeline.models.build_model` exposes a broad model zoo so experiments can toggle architectures via CLI flags:
+
+- Neural models: `cnn`, `rnn`, `lstm`, `transformer`, `graph`, `mlp` (PyTorch).
+- Tree ensembles & boosting: `random_forest`, `extra_trees`, `hist_gradient_boosting`, `xgboost`, `catboost`.
+- Linear baselines: `ridge`, `elastic_net`, `lasso`, `ols`.
+- Kernel methods: `svr`.
+
+Multi-output training (predicting all genes simultaneously) is available through the `--multi-output` flag; otherwise the pipeline iterates per gene.
+
+## 6. Training, Evaluation & Metrics
+
+- **Splits:** 70% train, 15% validation, 15% test, with `GroupShuffleSplit` maintaining sample coherence when a `group_key` is provided.
+- **Cross-validation:** 5-fold CV (grouped when enough unique labels exist) precedes final model fitting.
+- **Metrics:** MSE, RMSE, MAE, R², Spearman, and Pearson are recorded per split; per-fold CV metrics are also stored.
+- **History tracking:** Torch models optionally log per-epoch loss and correlation metrics for train/validation splits.
+
+## 7. Output Layout
+
+```text
+output/results/grn_regression/
+  └── <run_name>/
+      ├── selected_genes.csv
+      ├── summary_metrics.csv
+      └── models/
+          └── <model_id>/
+              ├── metrics_by_gene.csv
+              ├── metrics_summary.csv
+              ├── predictions_raw.csv (if generated)
+              ├── histories/ (per-gene CSV + plots, torch models)
+              └── scatter/residual/diagnostic figures
+```
+
+Logs for each CLI run live in `output/logs/<run_name>.log`; Slurm jobs write to `output/logs/<job-name>_<jobid>_<task>.{out,err}`.
+
+## 8. Job Submission Workflow
+
+- Use `scripts/select_random_genes.py` to produce reproducible manifests when sampling subsets.
+- Submit batch jobs with the generalized script:
+
+  ```bash
+  MODELS="cnn lstm transformer mlp" \
+  RUN_NAME=allgenes_meta20_k5 \
+  GENE_MANIFEST=data/manifests/all_genes_annotated.csv \
+  sbatch --array=1-4 jobs/slurm_grn_cellwise_chunked_gpu.sbatch
+
+  MODELS="xgboost svr random_forest extra_trees hist_gradient_boosting ridge elastic_net lasso ols" \
+  RUN_NAME=allgenes_meta20_k5_cpu \
+  GENE_MANIFEST=data/manifests/all_genes_annotated.csv \
+  sbatch --array=1-9 jobs/slurm_grn_cellwise_chunked.sbatch
+  ```
+
+- The script maps each array index to a model × chunk combination, activates the configured Conda environment, and forwards all relevant CLI arguments (device, pseudobulk settings, CV folds, etc.).
+
+## 9. Post-run Analysis
+
+1. Verify array tasks completed successfully and check aggregate metrics in `<run_name>/summary_metrics.csv`.
+2. Open `analysis/grn_results_analysis.ipynb`, adjust `RUN_INCLUDE_GLOBS` if necessary, and execute the notebook to regenerate per-gene test Pearson summaries, violin plots, RMSE comparisons, prediction-vs-truth scatters, and epoch curves.
+3. Commit regenerated figures/CSVs in `analysis/figs/` so published artifacts match the latest experiments.
+
+With these steps the repository is ready for publication: preprocessing is documented, all models are accessible via CLI and Slurm, and downstream analysis is consolidated in a single notebook.

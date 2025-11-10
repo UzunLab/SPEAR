@@ -1,0 +1,1095 @@
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import re
+import traceback
+from collections import OrderedDict, defaultdict
+from contextlib import contextmanager, nullcontext
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+import matplotlib.pyplot as plt
+
+import anndata as ad
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+
+from .config import PipelineConfig
+from .data import (
+    GeneInfo,
+    PeakIndexer,
+    build_cellwise_dataset,
+    build_gene_dataset,
+    filter_atac_by_genes,
+    load_datasets,
+    preprocess_modalities,
+    parse_gtf,
+    select_genes,
+)
+from .logging_utils import ResourceUsageTracker, get_logger
+from .training import CellwiseModelResult, ModelResult, train_model_for_gene, train_multi_output_model
+from .visualization import (
+    plot_feature_importance,
+    plot_correlation_boxplot,
+    plot_predictions_vs_actual,
+    plot_residual_barplot,
+    plot_residual_histogram,
+    plot_training_history_curves,
+)
+
+_LOG = get_logger(__name__)
+
+_FEATURE_BIN_PATTERN = re.compile(r"bin_(-?\d+)_to_(-?\d+)", re.IGNORECASE)
+
+
+def _feature_name_metadata(feature_name: str) -> Dict[str, object]:
+    """Parse common naming schemes to attach TSS-relative metadata."""
+
+    if not feature_name:
+        return {
+            "feature_class": "unknown",
+        }
+
+    token = feature_name.split("|", 1)[-1]
+    lowered = token.lower()
+    meta: Dict[str, object] = {
+        "feature_token": token,
+        "feature_class": "unknown",
+    }
+
+    if "peak" in lowered:
+        meta["feature_class"] = "atac_peak"
+
+    match = _FEATURE_BIN_PATTERN.search(token)
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2))
+        center = (start + end) / 2.0
+        meta.update(
+            {
+                "feature_class": "atac_bin",
+                "relative_start_bp": start,
+                "relative_end_bp": end,
+                "relative_center_bp": center,
+                "delta_to_tss_bp": center,
+                "distance_to_tss_bp": abs(center),
+                "delta_to_tss_kb": center / 1_000.0,
+                "distance_to_tss_kb": abs(center) / 1_000.0,
+            }
+        )
+
+    return meta
+
+try:
+    import torch.nn as _torch_nn
+except ImportError:  # pragma: no cover - torch optional during some tests
+    _torch_nn = None
+
+SELECTED_GENE_COUNT = 5000
+
+
+def run_pipeline(config: PipelineConfig) -> Path:
+    config.ensure_directories()
+
+    atac, rna = load_datasets(config.paths)
+    atac, rna = preprocess_modalities(atac, rna, config.training)
+
+    target_chromosomes = config.chromosomes
+    force_all_chromosomes = False
+    if target_chromosomes and len(target_chromosomes) == 1:
+        token = target_chromosomes[0].strip().lower()
+        if token in {"all", "genome-wide", "genome"}:
+            force_all_chromosomes = True
+            target_chromosomes = None
+
+    if target_chromosomes is None and config.multi_output and not force_all_chromosomes:
+        target_chromosomes = ["chr19"]
+        _LOG.info("No chromosome filter specified; defaulting to chr19 for multi-output mode (override with --chromosomes)")
+    elif force_all_chromosomes:
+        _LOG.info("Multi-output mode requested across all chromosomes")
+
+    genes_all = parse_gtf(
+        config.paths.gtf_path,
+        chromosomes=target_chromosomes,
+        gene_names=config.genes,
+    )
+    max_genes_for_selection = config.max_genes
+    if config.multi_output and not config.genes:
+        # Defer max_genes enforcement until after expression filtering for multi-output sampling
+        max_genes_for_selection = None
+    elif config.max_genes and not config.genes:
+        # Load the full candidate set so we can perform a random draw later
+        max_genes_for_selection = None
+
+    genes = select_genes(genes_all, requested_genes=config.genes, max_genes=max_genes_for_selection)
+
+    candidate_count = len(genes)
+    if (
+        not config.multi_output
+        and config.max_genes
+        and not config.genes
+        and candidate_count > config.max_genes
+    ):
+        rng = np.random.default_rng(config.training.random_state)
+        sample_indices = np.asarray(rng.choice(len(genes), size=config.max_genes, replace=False))
+        sample_indices.sort()
+        genes = [genes[int(idx)] for idx in sample_indices]
+        _LOG.info(
+            "Randomly sampled %d genes (from %d candidates) for gene-wise processing",
+            config.max_genes,
+            candidate_count,
+        )
+
+    if config.genes:
+        found_names = {gene.gene_name for gene in genes}
+        missing = [name for name in config.genes if name not in found_names]
+        if missing:
+            raise RuntimeError(
+                "The following requested genes were not found in annotations: "
+                + ", ".join(missing[:10])
+                + (" ..." if len(missing) > 10 else "")
+            )
+
+    selected_gene_fractions: Dict[str, float] = {}
+    manifest_mode = bool(config.genes)
+    if config.multi_output:
+        base_pool = genes if genes else genes_all
+        expressed_candidates, fraction_map = _genes_expressed_above_fraction(
+            base_pool,
+            rna,
+            min_expression=config.training.min_expression,
+            min_fraction=config.training.min_expression_fraction,
+        )
+
+        if manifest_mode:
+            missing = [
+                gene
+                for gene in genes
+                if fraction_map.get(gene.gene_name, 0.0) < config.training.min_expression_fraction
+            ]
+            if missing:
+                names = ", ".join(g.gene_name for g in missing[:10])
+                _LOG.error(
+                    "Manifest supplied %d genes below expression fraction threshold: %s%s",
+                    len(missing),
+                    names,
+                    " ..." if len(missing) > 10 else "",
+                )
+                raise RuntimeError(
+                    "Gene manifest contains entries below the minimum expression fraction threshold"
+                )
+            selected_gene_fractions = {
+                gene.gene_name: fraction_map.get(gene.gene_name, float("nan"))
+                for gene in genes
+            }
+            _LOG.info(
+                "Using %d genes from manifest with >=%.1f%% expressing cells",
+                len(genes),
+                config.training.min_expression_fraction * 100.0,
+            )
+        else:
+            requested_gene_count = config.max_genes or SELECTED_GENE_COUNT
+            if requested_gene_count <= 0:
+                raise RuntimeError("Configured max_genes must be >= 1 for multi-output mode")
+
+            available_gene_count = len(expressed_candidates)
+            if available_gene_count < requested_gene_count and not config.max_genes:
+                _LOG.warning(
+                    "Only %d genes meet the expression threshold (requested %d); proceeding with available genes",
+                    available_gene_count,
+                    requested_gene_count,
+                )
+
+            selected_gene_count = min(requested_gene_count, available_gene_count)
+            if selected_gene_count == 0:
+                raise RuntimeError(
+                    "No genes met the minimum expression fraction (>=%.2f of cells)"
+                    % config.training.min_expression_fraction
+                )
+
+            if available_gene_count < requested_gene_count and config.max_genes:
+                _LOG.warning(
+                    "Only %d genes meet the expression threshold (requested %d); proceeding with available genes",
+                    available_gene_count,
+                    requested_gene_count,
+                )
+
+            genes = _choose_random_genes(
+                expressed_candidates,
+                selected_gene_count,
+                config.training.random_state,
+            )
+            selected_gene_fractions = {
+                gene.gene_name: fraction_map.get(gene.gene_name, float("nan"))
+                for gene in genes
+            }
+            _LOG.info(
+                "Selected %d genome-wide genes with >=%.1f%% expressing cells",
+                len(genes),
+                config.training.min_expression_fraction * 100.0,
+            )
+            _LOG.debug("Selected genes: %s", ", ".join(g.gene_name for g in genes))
+
+    if config.multi_output and not genes:
+        raise RuntimeError("No genes matched the provided filters for multi-output training")
+
+    total_genes = len(genes)
+    chunk_total = max(1, int(config.chunk_total))
+    chunk_index = int(config.chunk_index)
+    applied_chunking = False
+    if chunk_index < 0:
+        chunk_index = 0
+    if chunk_index >= chunk_total:
+        chunk_index = chunk_total - 1
+    if chunk_total > 1 and total_genes:
+        chunk_size = math.ceil(total_genes / chunk_total)
+        start = chunk_index * chunk_size
+        end = min(total_genes, start + chunk_size)
+        _LOG.info(
+            "Applying chunk selection: total_genes=%d | chunk_total=%d | chunk_index=%d | chunk_size=%d | start=%d | end=%d",
+            total_genes,
+            chunk_total,
+            chunk_index,
+            chunk_size,
+            start,
+            end,
+        )
+        genes = genes[start:end]
+        applied_chunking = True
+
+    if not genes:
+        peak_indexer = PeakIndexer(atac, layer=config.training.atac_layer)
+    else:
+        atac = filter_atac_by_genes(atac, genes, config.training.window_bp)
+        peak_indexer = PeakIndexer(atac, layer=config.training.atac_layer)
+
+    if config.multi_output:
+        if applied_chunking:
+            _LOG.info(
+                "Multi-output chunk processed: index=%d/%d | genes_in_chunk=%d",
+                chunk_index,
+                chunk_total,
+                len(genes),
+            )
+        elif chunk_total > 1:
+            _LOG.warning(
+                "Chunk parameters specified (chunk_total=%d, chunk_index=%d) but no genes selected; proceeding without chunking",
+                chunk_total,
+                chunk_index,
+            )
+        return _run_cellwise_pipeline(
+            config,
+            genes,
+            atac,
+            rna,
+            peak_indexer,
+            chunk_index=chunk_index,
+            chunk_total=chunk_total,
+            gene_expression_fraction=selected_gene_fractions,
+        )
+
+    base_dir = config.paths.output_dir / "grn_regression"
+    run_dir = base_dir / config.run_name if config.run_name else base_dir
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    if not genes:
+        _LOG.warning(
+            "No genes assigned to this chunk (chunk_index=%d, chunk_total=%d). Nothing to process.",
+            chunk_index,
+            chunk_total,
+        )
+        return run_dir
+
+    summary_records: List[Dict[str, object]] = []
+    model_store: Dict[str, Dict[str, object]] = defaultdict(lambda: {
+        "predictions": [],
+        "metrics": [],
+        "feature_importances": [],
+        "feature_importances_genes": [],
+        "feature_names": None,
+        "histories": [],
+    })
+    model_export_meta: Dict[str, Dict[str, Any]] = {
+        name: {"successful_genes": [], "failures": []} for name in config.all_models()
+    }
+    model_config_snapshots: Dict[str, Dict[str, Any]] = {}
+    failures: List[str] = []
+
+    for gene in genes:
+        _LOG.info("Processing gene %s", gene.gene_name)
+        try:
+            dataset = build_gene_dataset(
+                gene,
+                atac,
+                rna,
+                peak_indexer,
+                config.training,
+            )
+        except ValueError as exc:
+            _LOG.warning("Skipping gene %s: %s", gene.gene_name, exc)
+            continue
+
+        for model_name in config.all_models():
+            _LOG.info("Training %s for gene %s", model_name, gene.gene_name)
+            try:
+                artifacts_dir = None
+                if model_name == "catboost":
+                    artifacts_dir = run_dir / "catboost_info" / gene.gene_name
+                result = train_model_for_gene(
+                    dataset,
+                    model_name,
+                    config.training,
+                    artifacts_dir=artifacts_dir,
+                )
+            except Exception as exc:
+                _LOG.error(
+                    "Model %s failed for gene %s: %s\n%s",
+                    model_name,
+                    gene.gene_name,
+                    exc,
+                    traceback.format_exc(),
+                )
+                failures.append(f"{model_name}|{gene.gene_name}: {exc}")
+                model_export_meta.setdefault(model_name, {"successful_genes": [], "failures": []})
+                model_export_meta[model_name]["failures"].append(
+                    {"gene": gene.gene_name, "error": str(exc)}
+                )
+                continue
+            preds_df = pd.DataFrame(result.predictions)
+            preds_df["gene"] = gene.gene_name
+
+            store = model_store[model_name]
+            store["predictions"].append(preds_df)
+            store["metrics"].append(
+                {
+                    "gene": gene.gene_name,
+                    **{f"train_{k}": v for k, v in result.train_metrics.items()},
+                    **{f"val_{k}": v for k, v in result.val_metrics.items()},
+                    **{f"test_{k}": v for k, v in result.test_metrics.items()},
+                }
+            )
+            feature_importances = _extract_feature_importance(result)
+            if feature_importances is not None:
+                store["feature_importances"].append(feature_importances)
+                store["feature_importances_genes"].append(gene.gene_name)
+                if store["feature_names"] is None:
+                    store["feature_names"] = list(dataset.feature_names)
+            if result.history:
+                store["histories"].append((gene.gene_name, result.history))
+
+            model_export_meta.setdefault(model_name, {"successful_genes": [], "failures": []})
+            model_export_meta[model_name]["successful_genes"].append(gene.gene_name)
+            if model_name not in model_config_snapshots and result.fitted_model is not None:
+                model_config_snapshots[model_name] = _capture_model_configuration(result.fitted_model)
+
+            summary_records.append(
+                {
+                    "gene": gene.gene_name,
+                    "model": model_name,
+                    **{f"cv_fold_{m.fold}_{k}": v for m in result.cv_metrics for k, v in m.metrics.items()},
+                    **{f"train_{k}": v for k, v in result.train_metrics.items()},
+                    **{f"val_{k}": v for k, v in result.val_metrics.items()},
+                    **{f"test_{k}": v for k, v in result.test_metrics.items()},
+                }
+            )
+
+    if summary_records:
+        summary_df = pd.DataFrame(summary_records)
+        summary_path = run_dir / "summary_metrics.csv"
+        summary_df.to_csv(summary_path, index=False)
+        _LOG.info("Run summary metrics saved to %s", summary_path)
+
+    models_dir = run_dir / "models"
+    models_dir.mkdir(exist_ok=True)
+
+    for model_name, store in model_store.items():
+        model_dir = models_dir / model_name
+        model_dir.mkdir(exist_ok=True)
+
+        predictions = store["predictions"]
+        if predictions:
+            preds_df = pd.concat(predictions, ignore_index=True)
+            preds_path = model_dir / "predictions_raw.csv"
+            preds_df.to_csv(preds_path, index=False)
+
+            for split in ["train", "val", "test"]:
+                subset = preds_df[preds_df["split"] == split]
+                if subset.empty:
+                    continue
+                plot_predictions_vs_actual(
+                    subset["y_true"].to_numpy(),
+                    subset["y_pred"].to_numpy(),
+                    model_dir / f"scatter_{split}.png",
+                    f"{model_name.upper()} | {split}",
+                )
+                plot_residual_histogram(
+                    subset["y_true"].to_numpy(),
+                    subset["y_pred"].to_numpy(),
+                    model_dir / f"residuals_{split}.png",
+                    f"Residuals | {model_name.upper()} | {split}",
+                )
+
+        metrics_records = store["metrics"]
+        if metrics_records:
+            metrics_df = pd.DataFrame(metrics_records)
+            metrics_df.to_csv(model_dir / "metrics_by_gene.csv", index=False)
+            metrics_mean = metrics_df.mean(numeric_only=True)
+            metrics_mean.to_csv(model_dir / "metrics_summary.csv", header=["value"])
+
+        feature_importances = store["feature_importances"]
+        feature_importance_genes = store.get("feature_importances_genes", [])
+        feature_names = store["feature_names"]
+        if feature_importances and feature_names:
+            try:
+                fi_stack = np.vstack(feature_importances)
+            except ValueError as exc:
+                _LOG.warning(
+                    "Skipping feature importance aggregation for %s due to shape mismatch: %s",
+                    model_name,
+                    exc,
+                )
+                fi_stack = None
+            if fi_stack is not None:
+                fi_mean = fi_stack.mean(axis=0)
+                plot_feature_importance(
+                    fi_mean,
+                    feature_names,
+                    model_dir / "feature_importance_mean.png",
+                    f"Feature importance | {model_name.upper()}",
+                )
+
+                fi_std = fi_stack.std(axis=0, ddof=0)
+                fi_median = np.median(fi_stack, axis=0)
+
+                metadata_records = [_feature_name_metadata(name) for name in feature_names]
+                metadata_df = pd.DataFrame(metadata_records) if metadata_records else None
+
+                aggregate_df = pd.DataFrame(
+                    {
+                        "feature": feature_names,
+                        "importance_mean": fi_mean,
+                        "importance_std": fi_std,
+                        "importance_median": fi_median,
+                    }
+                )
+                if metadata_df is not None and not metadata_df.empty:
+                    aggregate_df = pd.concat([aggregate_df, metadata_df], axis=1)
+                aggregate_df.to_csv(model_dir / "feature_importances_mean.csv", index=False)
+
+                if feature_importance_genes:
+                    long_records: List[Dict[str, object]] = []
+                    metadata_lookup = (
+                        {feature_names[idx]: metadata_records[idx] for idx in range(len(feature_names))}
+                        if metadata_records
+                        else {}
+                    )
+                    for gene_name, vector in zip(feature_importance_genes, feature_importances):
+                        for idx, value in enumerate(vector):
+                            entry: Dict[str, object] = {
+                                "gene": gene_name,
+                                "feature": feature_names[idx],
+                                "importance": float(value),
+                            }
+                            if metadata_lookup:
+                                entry.update(metadata_lookup.get(feature_names[idx], {}))
+                            long_records.append(entry)
+                    if long_records:
+                        per_gene_df = pd.DataFrame(long_records)
+                        per_gene_df.to_csv(
+                            model_dir / "feature_importances_per_gene.csv",
+                            index=False,
+                        )
+
+        histories = store["histories"]
+        if histories:
+            history_dir = model_dir / "histories"
+            history_dir.mkdir(exist_ok=True)
+            for gene_name, history_records in histories:
+                history_df = pd.DataFrame(history_records)
+                history_csv = history_dir / f"{gene_name}.csv"
+                history_df.to_csv(history_csv, index=False)
+                for metric in ("loss", "pearson", "spearman"):
+                    plot_training_history_curves(
+                        history_df,
+                        metric,
+                        history_dir / f"{gene_name}_{metric}.png",
+                        title=f"{model_name.upper()} | {gene_name} | {metric.title()}",
+                    )
+
+    model_run_details: Dict[str, Any] = {}
+    for name, meta in model_export_meta.items():
+        successes = sorted(set(meta.get("successful_genes", [])))
+        failure_records = meta.get("failures", [])
+        if successes:
+            status = "succeeded"
+        elif failure_records:
+            status = "failed"
+        else:
+            status = "skipped"
+        entry: Dict[str, Any] = {"status": status}
+        if successes:
+            entry["successful_genes"] = successes
+        if failure_records:
+            entry["failures"] = failure_records
+        if name in model_config_snapshots:
+            entry["estimator"] = model_config_snapshots[name]
+        model_run_details[name] = entry
+
+    processed_genes = sorted({row["gene"] for row in summary_records}) if summary_records else []
+    extra_context = {
+        "mode": "per_gene",
+        "requested_genes": sorted({gene.gene_name for gene in genes}) if genes else [],
+        "processed_genes": processed_genes,
+        "chunk_index": chunk_index,
+        "chunk_total": chunk_total,
+        "total_models": len(config.all_models()),
+    }
+    _export_run_configuration(config, run_dir, model_run_details, extra_context)
+
+    if failures:
+        raise RuntimeError(
+            "One or more gene-level model trainings failed: " + "; ".join(failures)
+        )
+
+    return run_dir
+
+
+def _run_cellwise_pipeline(
+    config: PipelineConfig,
+    genes: List[GeneInfo],
+    atac: ad.AnnData,
+    rna: ad.AnnData,
+    peak_indexer: PeakIndexer,
+    *,
+    chunk_index: int = 0,
+    chunk_total: int = 1,
+    gene_expression_fraction: Optional[Dict[str, float]] = None,
+) -> Path:
+    base_dir = config.paths.output_dir / "grn_regression_cellwise"
+    run_dir = base_dir / config.run_name if config.run_name else base_dir
+    run_dir.mkdir(parents=True, exist_ok=True)
+    catboost_tmp_root = run_dir / "catboost_tmp"
+
+    model_export_meta: Dict[str, Dict[str, Any]] = {
+        name: {"status": "pending", "failures": []} for name in config.all_models()
+    }
+    model_config_snapshots: Dict[str, Dict[str, Any]] = {}
+    overall_status = "failed"
+
+    try:
+        try:
+            _LOG.info(
+                "Constructing cell-wise dataset | genes=%d | chunk_index=%d | chunk_total=%d",
+                len(genes),
+                chunk_index,
+                chunk_total,
+            )
+            dataset = build_cellwise_dataset(
+                genes,
+                atac,
+                rna,
+                peak_indexer,
+                config.training,
+            )
+        except RuntimeError as exc:
+            _LOG.error("Failed to construct cell-wise dataset: %s", exc)
+            raise
+        except ValueError as exc:
+            _LOG.error("Failed to construct cell-wise dataset: %s", exc)
+            raise
+
+        models_dir = run_dir / "models"
+        _ensure_directory(models_dir)
+
+        _write_selected_genes(run_dir, dataset.genes, gene_expression_fraction)
+
+        extra_context = {
+            "mode": "multi_output",
+            "gene_names": [gene.gene_name for gene in dataset.genes],
+            "num_cells": dataset.num_cells(),
+            "num_features": dataset.num_features(),
+            "chunk_index": chunk_index,
+            "chunk_total": chunk_total,
+            "total_models": len(config.all_models()),
+        }
+
+        summary_records: List[Dict[str, object]] = []
+        failures: List[str] = []
+
+        def export_run_configuration_snapshot() -> None:
+            model_run_details: Dict[str, Any] = {}
+            for name, meta in model_export_meta.items():
+                entry: Dict[str, Any] = {
+                    "status": meta.get("status", "pending"),
+                }
+                failures_meta = meta.get("failures", [])
+                if failures_meta:
+                    entry["failures"] = failures_meta
+                if name in model_config_snapshots:
+                    entry["estimator"] = model_config_snapshots[name]
+                model_run_details[name] = entry
+            _export_run_configuration(config, run_dir, model_run_details, extra_context)
+
+        export_run_configuration_snapshot()
+
+        for model_name in config.all_models():
+            model_dir = _ensure_directory(models_dir / model_name)
+
+            _LOG.info(
+                "Training %s for multi-output regression across %d genes",
+                model_name,
+                dataset.num_genes(),
+            )
+
+            tracker = ResourceUsageTracker(
+                name=f"{model_name}_cellwise",
+                output_dir=model_dir,
+                interval_seconds=getattr(config.training, "resource_sample_seconds", 60.0),
+            )
+            artifacts_dir = None
+            if model_name == "catboost":
+                artifacts_dir = run_dir / "catboost_info"
+                _ensure_directory(artifacts_dir)
+
+            env_ctx = nullcontext()
+            if model_name == "catboost":
+                tmp_dir = _ensure_directory(catboost_tmp_root / f"{model_name}_tmp")
+                env_ctx = _temporary_env_var("CATBOOST_TMPDIR", str(tmp_dir))
+
+            try:
+                with env_ctx:
+                    with tracker:
+                        result = train_multi_output_model(
+                            dataset,
+                            model_name,
+                            config.training,
+                            artifacts_dir=artifacts_dir,
+                        )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                _LOG.error("Model %s failed in multi-output mode: %s", model_name, exc)
+                failures.append(f"{model_name}: {exc}")
+                model_export_meta[model_name]["status"] = "failed"
+                model_export_meta[model_name]["failures"].append(str(exc))
+            else:
+                model_dir = _ensure_directory(model_dir)
+                preds_df = _cellwise_predictions_dataframe(result)
+                preds_df.to_csv(model_dir / "predictions_raw.csv", index=False)
+
+                _write_cellwise_metrics(model_dir, result)
+                _plot_cellwise_diagnostics(model_dir, result)
+                if result.history:
+                    history_df = pd.DataFrame(result.history)
+                    history_csv = model_dir / "training_history.csv"
+                    history_df.to_csv(history_csv, index=False)
+                    for metric in ("loss", "pearson", "spearman"):
+                        plot_training_history_curves(
+                            history_df,
+                            metric,
+                            model_dir / f"training_history_{metric}.png",
+                            title=f"{model_name.upper()} | {metric.title()}",
+                        )
+
+                metric_payload = {"model": model_name, "num_genes": dataset.num_genes()}
+                for split in ("train", "val", "test"):
+                    metrics = result.aggregate_metrics.get(split, {})
+                    for metric_name in ("r2", "rmse", "mae", "spearman", "pearson"):
+                        key = f"{split}_{metric_name}"
+                        metric_payload[key] = metrics.get(metric_name)
+                summary_records.append(metric_payload)
+
+                model_export_meta[model_name]["status"] = "succeeded"
+                if model_name not in model_config_snapshots and result.fitted_model is not None:
+                    model_config_snapshots[model_name] = _capture_model_configuration(result.fitted_model)
+            finally:
+                export_run_configuration_snapshot()
+
+        if summary_records:
+            summary_df = pd.DataFrame(summary_records)
+            summary_df.to_csv(run_dir / "summary_metrics.csv", index=False)
+
+        export_run_configuration_snapshot()
+
+        if failures:
+            raise RuntimeError(
+                "One or more models failed in multi-output mode: "
+                + "; ".join(failures)
+            )
+
+        overall_status = "succeeded"
+        return run_dir
+    finally:
+        model_status_snapshot = {
+            name: meta.get("status", "pending") for name, meta in model_export_meta.items()
+        }
+        try:
+            _update_run_status_overview(
+                base_dir,
+                run_dir,
+                config.run_name,
+                model_status_snapshot,
+                overall_status,
+            )
+        except Exception:  # pragma: no cover - diagnostics only
+            _LOG.warning("Failed to update run status overview", exc_info=True)
+
+
+def _genes_expressed_above_fraction(
+    genes: List[GeneInfo],
+    rna: ad.AnnData,
+    *,
+    min_expression: float,
+    min_fraction: float,
+) -> Tuple[List[GeneInfo], Dict[str, float]]:
+    total_cells = int(rna.n_obs)
+    if total_cells == 0:
+        return [], {}
+
+    var_names = np.asarray(rna.var_names).astype(str)
+    name_to_idx = {name: idx for idx, name in enumerate(var_names)}
+
+    candidates: List[GeneInfo] = []
+    fractions: Dict[str, float] = {}
+
+    for gene in genes:
+        idx = name_to_idx.get(gene.gene_name)
+        if idx is None:
+            continue
+        column = rna.X[:, idx]
+        if sp.issparse(column):
+            values = column.toarray().ravel()
+        else:
+            values = np.asarray(column).ravel()
+        expressed = values >= min_expression
+        fraction = float(expressed.sum() / total_cells)
+        fractions[gene.gene_name] = fraction
+        if fraction >= min_fraction:
+            candidates.append(gene)
+
+    return candidates, fractions
+
+
+def _choose_random_genes(
+    genes: List[GeneInfo],
+    count: int,
+    random_state: int,
+) -> List[GeneInfo]:
+    rng = np.random.default_rng(random_state)
+    indices = rng.choice(len(genes), size=count, replace=False)
+    return [genes[int(i)] for i in indices]
+
+
+def _ensure_directory(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+@contextmanager
+def _temporary_env_var(key: str, value: str) -> Iterator[None]:
+    previous = os.environ.get(key)
+    os.environ[key] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+def _write_selected_genes(
+    run_dir: Path,
+    genes: List[GeneInfo],
+    gene_expression_fraction: Optional[Dict[str, float]],
+) -> None:
+    if not genes:
+        return
+    out_path = run_dir / "selected_genes.csv"
+    rows = ["gene_name,gene_id,chrom,expression_fraction"]
+    expr_map = gene_expression_fraction or {}
+    for gene in sorted(genes, key=lambda g: g.gene_name):
+        frac = expr_map.get(gene.gene_name, float("nan"))
+        rows.append(f"{gene.gene_name},{gene.gene_id},{gene.chrom},{frac}")
+    out_path.write_text("\n".join(rows) + "\n")
+    _LOG.info("Recorded selected gene list to %s", out_path)
+
+
+def _cellwise_predictions_dataframe(result: CellwiseModelResult) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for split, payload in result.split_predictions.items():
+        cell_ids = payload["cell_ids"]
+        y_true = payload["y_true"]
+        y_pred = payload["y_pred"]
+        for cell_idx, cell_id in enumerate(cell_ids):
+            for gene_idx, gene in enumerate(result.gene_names):
+                rows.append(
+                    {
+                        "split": split,
+                        "cell_id": cell_id,
+                        "gene": gene,
+                        "y_true": float(y_true[cell_idx, gene_idx]),
+                        "y_pred": float(y_pred[cell_idx, gene_idx]),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def _write_cellwise_metrics(model_dir: Path, result: CellwiseModelResult) -> None:
+    _ensure_directory(model_dir)
+    agg_df = pd.DataFrame(result.aggregate_metrics).T
+    agg_df.index.name = "split"
+    agg_df.to_csv(model_dir / "metrics_aggregate.csv")
+
+    per_gene_rows: List[Dict[str, object]] = []
+    for split, metrics_list in result.per_gene_metrics.items():
+        for metrics in metrics_list:
+            row = dict(metrics)
+            row["split"] = split
+            per_gene_rows.append(row)
+    if per_gene_rows:
+        per_gene_df = pd.DataFrame(per_gene_rows)
+        per_gene_df.to_csv(model_dir / "metrics_per_gene.csv", index=False)
+
+    if result.cv_metrics:
+        cv_df = pd.DataFrame(
+            [{"fold": fm.fold, **fm.metrics} for fm in result.cv_metrics]
+        )
+        cv_df.to_csv(model_dir / "metrics_cv.csv", index=False)
+
+
+def _plot_cellwise_diagnostics(model_dir: Path, result: CellwiseModelResult) -> None:
+    _ensure_directory(model_dir)
+    for split, payload in result.split_predictions.items():
+        y_true_matrix = payload["y_true"]
+        y_pred_matrix = payload["y_pred"]
+        y_true = y_true_matrix.ravel()
+        y_pred = y_pred_matrix.ravel()
+        if y_true.size == 0:
+            continue
+        plot_predictions_vs_actual(
+            y_true,
+            y_pred,
+            model_dir / f"scatter_{split}.png",
+            f"{result.model_name.upper()} | {split}",
+            annotation_metrics=result.aggregate_metrics.get(split),
+        )
+        plot_residual_histogram(
+            y_true,
+            y_pred,
+            model_dir / f"residuals_{split}.png",
+            f"Residuals | {result.model_name.upper()} | {split}",
+        )
+        plot_residual_barplot(
+            y_true_matrix,
+            y_pred_matrix,
+            result.gene_names,
+            model_dir / f"residual_bar_{split}.png",
+            f"Mean absolute residuals | {result.model_name.upper()} | {split}",
+        )
+
+    per_gene_val = result.per_gene_metrics.get("val", [])
+    if per_gene_val:
+        pearson_vals = [entry.get("pearson") for entry in per_gene_val]
+        spearman_vals = [entry.get("spearman") for entry in per_gene_val]
+        valid_pearson = [val for val in pearson_vals if val is not None]
+        valid_spearman = [val for val in spearman_vals if val is not None]
+        if valid_pearson or valid_spearman:
+            model_dir.mkdir(parents=True, exist_ok=True)
+            fig, axes = plt.subplots(1, 2, figsize=(9, 6), sharey=True)
+            if valid_spearman:
+                plot_correlation_boxplot(
+                    valid_spearman,
+                    output_path=model_dir / "correlation_boxplots_val.png",
+                    title=f"{result.model_name.upper()} | Spearman",
+                    metric_label="Spearman correlation coefficient",
+                    axes=axes[0],
+                )
+            else:
+                axes[0].axis("off")
+            if valid_pearson:
+                plot_correlation_boxplot(
+                    valid_pearson,
+                    output_path=model_dir / "correlation_boxplots_val.png",
+                    title=f"{result.model_name.upper()} | Pearson",
+                    metric_label="Pearson correlation coefficient",
+                    axes=axes[1],
+                )
+            else:
+                axes[1].axis("off")
+            fig.suptitle(f"{result.model_name.upper()} | Validation Correlations", y=0.92)
+            fig.tight_layout(rect=(0, 0, 1, 0.95))
+            fig.savefig(model_dir / "correlation_boxplots_val.png")
+            plt.close(fig)
+
+
+def _serialize_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, np.generic):  # numpy scalar
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _serialize_value(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_serialize_value(item) for item in value]
+    if is_dataclass(value):
+        return {key: _serialize_value(val) for key, val in asdict(value).items()}
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:  # pragma: no cover - defensive conversion
+            pass
+    if hasattr(value, "__dict__") and not isinstance(value, type):
+        try:
+            return {key: _serialize_value(val) for key, val in vars(value).items()}
+        except Exception:  # pragma: no cover - defensive conversion
+            pass
+    return repr(value)
+
+
+def _capture_model_configuration(model: object) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "type": model.__class__.__name__,
+        "module": f"{model.__class__.__module__}.{model.__class__.__qualname__}",
+    }
+    if _torch_nn is not None and isinstance(model, _torch_nn.Module):
+        try:
+            total_params = int(sum(param.numel() for param in model.parameters()))
+            trainable_params = int(sum(param.numel() for param in model.parameters() if param.requires_grad))
+        except Exception:  # pragma: no cover - fallback when parameters unavailable
+            total_params = trainable_params = 0
+        summary.update(
+            {
+                "framework": "torch",
+                "parameter_count": total_params,
+                "trainable_parameter_count": trainable_params,
+                "representation": repr(model),
+            }
+        )
+        return summary
+    if hasattr(model, "get_params"):
+        try:
+            params = model.get_params(deep=True)
+        except Exception as exc:  # pragma: no cover - estimator without get_params support
+            params = {"_error": f"get_params failed: {exc}"}
+        summary.update(
+            {
+                "framework": "sklearn",
+                "parameters": _serialize_value(params),
+                "representation": repr(model),
+            }
+        )
+        return summary
+    summary["representation"] = repr(model)
+    return summary
+
+
+def _utc_timestamp() -> str:
+    """Return a timezone-aware UTC timestamp with a trailing Z."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _export_run_configuration(
+    config: PipelineConfig,
+    run_dir: Path,
+    model_details: Dict[str, Any],
+    extra_context: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload: "OrderedDict[str, Any]" = OrderedDict()
+    payload["model_configurations"] = _serialize_value(model_details)
+    payload["pipeline_config"] = {
+        "paths": _serialize_value(config.paths),
+        "training": _serialize_value(config.training),
+        "models": _serialize_value(config.models),
+        "genes": _serialize_value(config.genes),
+        "chromosomes": _serialize_value(config.chromosomes),
+        "max_genes": config.max_genes,
+        "chunk_total": config.chunk_total,
+        "chunk_index": config.chunk_index,
+        "multi_output": config.multi_output,
+    }
+    payload["run_name"] = config.run_name
+    payload["timestamp_utc"] = _utc_timestamp()
+    if extra_context:
+        payload["run_context"] = _serialize_value(extra_context)
+
+    output_path = run_dir / "run_configuration.json"
+    output_path.write_text(json.dumps(payload, indent=2) + "\n")
+    _LOG.info("Exported run configuration snapshot to %s", output_path)
+
+
+def _update_run_status_overview(
+    base_dir: Path,
+    run_dir: Path,
+    run_name: Optional[str],
+    model_statuses: Dict[str, str],
+    overall_status: str,
+) -> None:
+    summary_path = base_dir / "run_status_overview.json"
+    try:
+        summary = json.loads(summary_path.read_text())
+    except FileNotFoundError:
+        summary = {}
+    except json.JSONDecodeError:
+        summary = {}
+
+    summary.setdefault("succeeded", [])
+    summary.setdefault("failed", [])
+
+    identifier = run_name or run_dir.name
+    run_path = str(run_dir.resolve())
+    updated_at = _utc_timestamp()
+
+    def _filtered(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [
+            entry
+            for entry in entries
+            if entry.get("run_name") != identifier and entry.get("path") != run_path
+        ]
+
+    summary["succeeded"] = _filtered(summary["succeeded"])
+    summary["failed"] = _filtered(summary["failed"])
+
+    entry: Dict[str, Any] = {
+        "run_name": identifier,
+        "path": run_path,
+        "model_statuses": model_statuses,
+        "updated_at": updated_at,
+    }
+    target = "succeeded" if overall_status == "succeeded" else "failed"
+
+    summary[target].append(entry)
+
+    def _sort(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return sorted(
+            entries,
+            key=lambda item: item.get("updated_at", ""),
+            reverse=True,
+        )
+
+    summary["succeeded"] = _sort(summary["succeeded"])
+    summary["failed"] = _sort(summary["failed"])
+    summary["generated_at"] = _utc_timestamp()
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+
+
+def _extract_feature_importance(result: ModelResult) -> np.ndarray | None:
+    model = getattr(result, "fitted_model", None)
+    if model is None:
+        return None
+    if hasattr(model, "feature_importances_"):
+        return np.asarray(model.feature_importances_, dtype=np.float64)
+    if hasattr(model, "coef_"):
+        coef = np.asarray(model.coef_)
+        return np.abs(coef.ravel())
+    return None
