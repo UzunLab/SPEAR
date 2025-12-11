@@ -105,21 +105,104 @@ def plot_residual_histogram(y_true: np.ndarray, y_pred: np.ndarray, output_path:
     plt.close()
 
 
-def plot_feature_importance(importances: np.ndarray, feature_names: Iterable[str], output_path: Path, title: str) -> None:
-    if importances.size == 0:
+def plot_feature_importance(
+    importances: np.ndarray,
+    feature_names: Iterable[str],
+    output_path: Path,
+    title: str,
+    top_n: int = 30,
+) -> None:
+    importances = np.asarray(importances, dtype=np.float64)
+    names = np.asarray(list(feature_names))
+    if importances.size == 0 or names.size != importances.size:
         return
-    indices = np.argsort(importances)[::-1]
-    sorted_importances = importances[indices]
-    sorted_names = np.asarray(list(feature_names))[indices]
+
+    ranked = np.argsort(importances)[::-1]
+    limit = int(min(max(top_n, 1), ranked.size))
+    ranked = ranked[:limit]
+    sorted_importances = importances[ranked]
+    sorted_names = names[ranked]
+
+    fig_height = max(4.0, 0.35 * limit)
+    fig, ax = plt.subplots(figsize=(9, fig_height))
+    bars = ax.barh(np.arange(limit), sorted_importances, color="#4C72B0")
+    ax.set_yticks(np.arange(limit))
+    ax.set_yticklabels(sorted_names)
+    ax.invert_yaxis()  # Largest importance at top for easier scanning
+    ax.set_xlabel("Importance")
+    ax.set_ylabel("Feature")
+    ax.set_title(title)
+    if np.any(sorted_importances > 0):
+        ax.set_xlim(left=0)
+    for bar, value in zip(bars, sorted_importances):
+        if value <= 0:
+            continue
+        ax.text(
+            value,
+            bar.get_y() + bar.get_height() / 2,
+            f" {value:.3f}",
+            va="center",
+            ha="left",
+            fontsize=8,
+        )
+    fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(8, 6))
-    sns.barplot(x=sorted_importances, y=sorted_names)
-    plt.xlabel("Importance")
-    plt.ylabel("Feature")
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_per_gene_feature_panel(
+    block_df: pd.DataFrame,
+    gene_name: str,
+    output_path: Path,
+    top_n: int = 12,
+) -> None:
+    if block_df.empty:
+        return
+    sanitized = block_df.copy()
+    sanitized = sanitized.sort_values("importance_mean", ascending=False)
+    subset = sanitized.head(max(1, top_n)).copy()
+    has_distance = "distance_to_tss_kb" in sanitized.columns and sanitized["distance_to_tss_kb"].notna().any()
+    cols = 2 if has_distance else 1
+    fig_height = max(4.0, subset.shape[0] * 0.35)
+    fig, axes = plt.subplots(1, cols, figsize=(cols * 5.5, fig_height))
+    if cols == 1:
+        axes = [axes]
+
+    bar_ax = axes[0]
+    y_pos = np.arange(subset.shape[0])
+    bar_ax.barh(y_pos, subset["importance_mean"], color="#4C72B0")
+    bar_ax.set_yticks(y_pos)
+    bar_ax.set_yticklabels(subset["feature"].astype(str))
+    bar_ax.invert_yaxis()
+    bar_ax.set_xlabel("Importance")
+    bar_ax.set_title(f"{gene_name} | top features")
+    for idx, value in enumerate(subset["importance_mean"]):
+        if value <= 0:
+            continue
+        bar_ax.text(value, idx, f" {value:.3f}", va="center", ha="left", fontsize=8)
+
+    if has_distance:
+        scatter_ax = axes[1]
+        scatter_data = sanitized.dropna(subset=["distance_to_tss_kb", "importance_mean"])
+        scatter_ax.scatter(
+            scatter_data["distance_to_tss_kb"],
+            scatter_data["importance_mean"],
+            s=20,
+            alpha=0.6,
+            edgecolor="none",
+            color="#1f77b4",
+        )
+        scatter_ax.axvline(0.0, linestyle="--", color="#d62728", linewidth=1.0)
+        scatter_ax.set_xlabel("Distance to TSS (kb)")
+        scatter_ax.set_ylabel("Importance")
+        scatter_ax.set_title(f"{gene_name} | distance profile")
+
+    fig.suptitle(f"Feature importance panel | {gene_name}", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
 
 
 def save_metric_table(metrics: Dict[str, float], output_path: Path) -> None:
@@ -206,6 +289,112 @@ def plot_correlation_boxplot(
         plt.tight_layout()
         plt.savefig(output_path)
         plt.close()
+
+
+def plot_importance_distance_scatter(
+    importances: Sequence[float],
+    distances_kb: Sequence[float],
+    output_path: Path,
+    title: str,
+    annotation: Optional[Dict[str, float]] = None,
+    *,
+    max_distance_kb: float | None = 10.0,
+    rolling_window: int = 51,
+) -> None:
+    imp = np.asarray(importances, dtype=np.float64)
+    dist = np.asarray(distances_kb, dtype=np.float64)
+    mask = np.isfinite(imp) & np.isfinite(dist)
+    imp = imp[mask]
+    dist = dist[mask]
+    if max_distance_kb is not None:
+        span_mask = np.abs(dist) <= max_distance_kb
+        imp = imp[span_mask]
+        dist = dist[span_mask]
+    if imp.size == 0:
+        return
+
+    order = np.argsort(dist)
+    dist_sorted = dist[order]
+    imp_sorted = imp[order]
+    rolling = pd.Series(imp_sorted).rolling(window=rolling_window, min_periods=10).mean()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(7, 5))
+    sns.scatterplot(x=dist_sorted, y=imp_sorted, s=12, alpha=0.35, edgecolor="none")
+    sns.lineplot(
+        x=dist_sorted,
+        y=rolling,
+        color="#d62728",
+        linewidth=1.4,
+        label="Rolling mean",
+    )
+    plt.axvline(0.0, linestyle="--", color="#444", linewidth=1.0, alpha=0.7)
+    if max_distance_kb is not None:
+        plt.xlim(-max_distance_kb, max_distance_kb)
+    plt.xlabel("Distance to TSS (kb)")
+    plt.ylabel("Feature importance")
+    plt.title(title)
+    if annotation:
+        text = "\n".join(f"{k}={v:.3f}" for k, v in annotation.items() if np.isfinite(v))
+        if text:
+            plt.text(
+                0.03,
+                0.97,
+                text,
+                transform=plt.gca().transAxes,
+                va="top",
+                ha="left",
+                fontsize=10,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+            )
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
+def plot_cumulative_importance_overlay(
+    importances: Sequence[float],
+    distances_kb: Sequence[float],
+    output_path: Path,
+    title: str,
+) -> None:
+    imp = np.asarray(importances, dtype=np.float64)
+    dist = np.asarray(distances_kb, dtype=np.float64)
+    mask = np.isfinite(imp) & np.isfinite(dist)
+    imp = imp[mask]
+    dist = np.abs(dist[mask])
+    if imp.size == 0:
+        return
+    order = np.argsort(dist)
+    dist = dist[order]
+    imp = imp[order]
+    imp = np.clip(imp, a_min=0.0, a_max=None)
+    total = imp.sum()
+    if total <= 0:
+        cumulative = np.linspace(0.0, 1.0, imp.size)
+    else:
+        cumulative = np.cumsum(imp) / total
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(dist, cumulative, color="#1f77b4", linewidth=2.0)
+    ax.fill_between(dist, cumulative, alpha=0.15, color="#1f77b4")
+    ax.set_xlabel("|Distance to TSS| (kb)")
+    ax.set_ylabel("Cumulative importance fraction")
+    ax.set_title(title)
+    if dist.size:
+        ninety = float(dist[min(len(dist) - 1, max(1, int(0.9 * len(dist)) - 1))])
+        ax.text(
+            0.02,
+            0.08,
+            f"90% of ranked features within ~{ninety:.1f} kb",
+            transform=ax.transAxes,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+    ax.grid(True, which="major", axis="both", linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
 
 
 def plot_training_history_curves(

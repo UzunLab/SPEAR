@@ -139,7 +139,8 @@ class PipelineConfig:
     max_genes: Optional[int] = None
     chunk_total: int = 1
     chunk_index: int = 0
-    multi_output: bool = False
+    # Default to cell-wise multi-output unless explicitly turned off
+    multi_output: bool = True
     run_name: Optional[str] = None
 
     def ensure_directories(self) -> None:

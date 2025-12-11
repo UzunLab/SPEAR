@@ -76,7 +76,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-index", type=int, default=0, help="Zero-based index of the gene chunk to process")
     parser.add_argument("--chunk-total", type=int, default=1, help="Total number of gene chunks across all jobs")
     parser.add_argument("--config-json", help="Path to configuration JSON file to load")
-    parser.add_argument("--multi-output", action="store_true", help="Enable cell-wise multi-output training mode")
+    parser.add_argument(
+        "--per-gene",
+        action="store_true",
+        help="Run per-gene training (one model per gene) instead of the default cell-wise multi-output mode",
+    )
     parser.add_argument("--rf-n-estimators", type=int, help="Number of trees for random forest models")
     parser.add_argument("--rf-max-depth", type=int, help="Maximum depth for random forest models")
     parser.add_argument("--rf-min-samples-leaf", type=int, help="Minimum samples per leaf for random forest models")
@@ -183,7 +187,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             max_genes=args.max_genes,
             chunk_total=args.chunk_total,
             chunk_index=args.chunk_index,
-            multi_output=args.multi_output,
+            multi_output=not args.per_gene,
         )
 
     run_name = args.run_name or f"grn_regression_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -198,9 +202,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         output_dir = run_pipeline(config)
     except Exception:
         logger.exception("Pipeline terminated with an error")
+        logger.error("RUN_COMPLETE_STATUS=FAILURE")
         raise SystemExit(1)
 
     logger.info("Pipeline complete. Results stored in %s", output_dir)
+    logger.info("RUN_COMPLETE_STATUS=SUCCESS")
 
 
 def _config_from_json(payload: dict) -> PipelineConfig:
@@ -222,7 +228,8 @@ def _config_from_json(payload: dict) -> PipelineConfig:
         max_genes=payload.get("max_genes"),
         chunk_total=payload.get("chunk_total", 1),
         chunk_index=payload.get("chunk_index", 0),
-        multi_output=payload.get("multi_output", False),
+        # Default to multi-output unless explicitly disabled in JSON payload
+        multi_output=payload.get("multi_output", True),
     )
 
 

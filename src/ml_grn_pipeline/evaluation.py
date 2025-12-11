@@ -5,20 +5,20 @@ import logging
 import math
 import os
 import re
+import time
 import traceback
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
-
-import matplotlib.pyplot as plt
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import matplotlib.pyplot as plt
 
 from .config import PipelineConfig
 from .data import (
@@ -41,6 +41,9 @@ from .visualization import (
     plot_residual_barplot,
     plot_residual_histogram,
     plot_training_history_curves,
+    plot_importance_distance_scatter,
+    plot_per_gene_feature_panel,
+    plot_cumulative_importance_overlay,
 )
 
 _LOG = get_logger(__name__)
@@ -56,12 +59,18 @@ def _feature_name_metadata(feature_name: str) -> Dict[str, object]:
             "feature_class": "unknown",
         }
 
-    token = feature_name.split("|", 1)[-1]
+    gene_name: Optional[str] = None
+    if "|" in feature_name:
+        gene_name, token = feature_name.split("|", 1)
+    else:
+        token = feature_name
     lowered = token.lower()
     meta: Dict[str, object] = {
         "feature_token": token,
         "feature_class": "unknown",
     }
+    if gene_name:
+        meta["gene_name"] = gene_name
 
     if "peak" in lowered:
         meta["feature_class"] = "atac_peak"
@@ -80,11 +89,232 @@ def _feature_name_metadata(feature_name: str) -> Dict[str, object]:
                 "delta_to_tss_bp": center,
                 "distance_to_tss_bp": abs(center),
                 "delta_to_tss_kb": center / 1_000.0,
-                "distance_to_tss_kb": abs(center) / 1_000.0,
+                # Preserve a signed distance for plotting/correlation; keep abs variant for convenience
+                "distance_to_tss_kb": center / 1_000.0,
+                "distance_to_tss_abs_kb": abs(center) / 1_000.0,
             }
         )
 
     return meta
+
+
+def _export_feature_importance_artifacts(
+    output_dir: Path,
+    model_name: str,
+    importances: np.ndarray,
+    feature_names: Sequence[str],
+    *,
+    method: Optional[str] = None,
+    gene_names: Optional[Sequence[str]] = None,
+    feature_block_slices: Optional[Sequence[Tuple[int, int]]] = None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fi = np.asarray(importances, dtype=np.float64)
+    feature_count = int(fi.size if fi.ndim == 1 else fi.shape[-1])
+    if feature_count == 0:
+        _LOG.info("Feature importance export skipped | model=%s | reason=no features", model_name)
+        return
+
+    start_wall = time.perf_counter()
+    start_ts = datetime.now(timezone.utc).isoformat()
+    _LOG.info(
+        "Feature importance export start | model=%s | features=%d | output_dir=%s | timestamp=%s",
+        model_name,
+        feature_count,
+        output_dir,
+        start_ts,
+    )
+
+    if fi.ndim == 1:
+        fi_stack = fi[None, :]
+    else:
+        fi_stack = fi
+
+    fi_mean = np.nanmean(fi_stack, axis=0)
+    fi_std = np.nanstd(fi_stack, axis=0, ddof=0)
+    fi_median = np.nanmedian(fi_stack, axis=0)
+
+    raw_path = output_dir / "feature_importances_raw.npz"
+    np.savez_compressed(
+        raw_path,
+        importances=fi_stack,
+        feature_names=np.asarray(feature_names),
+    )
+    _LOG.info(
+        "Saved raw feature importances (%s features, stack shape=%s) to %s",
+        fi_stack.shape[-1],
+        tuple(fi_stack.shape),
+        raw_path,
+    )
+
+    plot_feature_importance(
+        fi_mean,
+        feature_names,
+        output_dir / "feature_importance_mean.png",
+        f"Feature importance | {model_name.upper()}",
+    )
+
+    metadata_records = [_feature_name_metadata(name) for name in feature_names]
+    metadata_df = pd.DataFrame(metadata_records) if metadata_records else None
+
+    aggregate_df = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "importance_mean": fi_mean,
+            "importance_std": fi_std,
+            "importance_median": fi_median,
+        }
+    )
+    if metadata_df is not None and not metadata_df.empty:
+        aggregate_df = pd.concat([aggregate_df, metadata_df], axis=1)
+
+    aggregate_path = output_dir / "feature_importances_mean.csv"
+    aggregate_df.to_csv(aggregate_path, index=False)
+    _LOG.info(
+        "Saved aggregate feature importance stats (%d rows) to %s",
+        aggregate_df.shape[0],
+        aggregate_path,
+    )
+
+    if "feature_class" in aggregate_df.columns:
+        class_counts = aggregate_df["feature_class"].value_counts(dropna=False).head(5)
+        if not class_counts.empty:
+            breakdown = ", ".join(f"{str(cls)}:{int(cnt)}" for cls, cnt in class_counts.items())
+            _LOG.info("Feature class breakdown | %s | %s", model_name, breakdown)
+
+    top_feature_rows = aggregate_df.sort_values("importance_mean", ascending=False).head(5)
+    if not top_feature_rows.empty:
+        top_summary = ", ".join(
+            f"{row.feature}={row.importance_mean:.4f}"
+            for row in top_feature_rows.itertuples()
+        )
+        _LOG.info("Top feature importances | %s | %s", model_name, top_summary)
+
+    per_gene_summary_path: Optional[Path] = None
+    if feature_block_slices and gene_names:
+        per_gene_records: List[Dict[str, object]] = []
+        gene_block_ranges: Dict[str, Tuple[int, int]] = {}
+        limit = min(len(feature_block_slices), len(gene_names))
+        for idx in range(limit):
+            start, end = feature_block_slices[idx]
+            start = max(0, start)
+            end = min(len(feature_names), end)
+            if start >= end:
+                continue
+            block = aggregate_df.iloc[start:end].copy()
+            if block.empty:
+                continue
+            gene_label = gene_names[idx]
+            gene_block_ranges[gene_label] = (start, end)
+            record: Dict[str, object] = {
+                "gene": gene_label,
+                "feature_count": int(block.shape[0]),
+                "importance_mean_sum": float(block["importance_mean"].sum()),
+                "importance_mean_avg": float(block["importance_mean"].mean()),
+                "top_feature": str(block.loc[block["importance_mean"].idxmax(), "feature"]),
+                "top_feature_importance": float(block["importance_mean"].max()),
+            }
+            if "distance_to_tss_kb" in block.columns:
+                distances = pd.to_numeric(block["distance_to_tss_kb"], errors="coerce")
+                mask = np.isfinite(distances) & np.isfinite(block["importance_mean"])
+                if mask.any():
+                    record["pearson_distance_corr"] = float(
+                        block.loc[mask, "importance_mean"].corr(distances[mask], method="pearson")
+                    )
+                    record["spearman_distance_corr"] = float(
+                        block.loc[mask, "importance_mean"].corr(distances[mask], method="spearman")
+                    )
+                    top_idx = block.loc[mask, "importance_mean"].idxmax()
+                    record["top_feature_distance_kb"] = float(distances.loc[top_idx])
+            per_gene_records.append(record)
+        if per_gene_records:
+            per_gene_df = pd.DataFrame(per_gene_records)
+            per_gene_summary_path = output_dir / "feature_importance_per_gene_summary.csv"
+            per_gene_df.to_csv(per_gene_summary_path, index=False)
+            _LOG.info(
+                "Saved per-gene feature importance summary (%d genes) to %s",
+                per_gene_df.shape[0],
+                per_gene_summary_path,
+            )
+
+            panel_dir = output_dir / "per_gene_panels"
+            panel_candidates = per_gene_df.sort_values("importance_mean_sum", ascending=False).head(12)
+            generated = 0
+            for gene_value in panel_candidates["gene"]:
+                block_range = gene_block_ranges.get(gene_value)
+                if not block_range:
+                    continue
+                start, end = block_range
+                block_slice = aggregate_df.iloc[start:end].copy()
+                if block_slice.empty:
+                    continue
+                safe_gene = re.sub(r"[^A-Za-z0-9._-]", "_", gene_value)
+                panel_path = panel_dir / f"{safe_gene}.png"
+                plot_per_gene_feature_panel(block_slice, gene_value, panel_path)
+                generated += 1
+            if generated:
+                _LOG.info("Generated %d per-gene feature panels in %s", generated, panel_dir)
+
+    summary_payload: Dict[str, object] = {
+        "method": method or "unknown",
+        "num_features": int(fi_mean.size),
+        "raw_importances_file": raw_path.name,
+        "aggregate_file": aggregate_path.name,
+    }
+    if per_gene_summary_path is not None:
+        summary_payload["per_gene_summary_file"] = per_gene_summary_path.name
+
+    if "distance_to_tss_kb" in aggregate_df.columns:
+        distances = pd.to_numeric(aggregate_df["distance_to_tss_kb"], errors="coerce")
+        mask = np.isfinite(distances) & np.isfinite(fi_mean)
+        if mask.any():
+            pearson = float(pd.Series(fi_mean[mask]).corr(distances[mask], method="pearson"))
+            spearman = float(pd.Series(fi_mean[mask]).corr(distances[mask], method="spearman"))
+            corr_payload = {
+                "pearson": pearson,
+                "spearman": spearman,
+                "count": int(mask.sum()),
+                "method": method or "unknown",
+            }
+            summary_payload["tss_correlation"] = corr_payload
+            scatter_path = output_dir / "feature_importance_vs_tss_distance.png"
+            plot_importance_distance_scatter(
+                fi_mean[mask],
+                distances[mask],
+                scatter_path,
+                f"FI vs TSS distance | {model_name.upper()}",
+                annotation={"Spearman": spearman, "Pearson": pearson},
+            )
+            corr_path = output_dir / "feature_importance_tss_correlation.json"
+            corr_path.write_text(json.dumps(corr_payload, indent=2))
+            _LOG.info(
+                "Saved FI vs TSS scatter and correlation stats (n=%d) to %s and %s",
+                mask.sum(),
+                scatter_path,
+                corr_path,
+            )
+
+            overlay_path = output_dir / "feature_importance_distance_overview.png"
+            plot_cumulative_importance_overlay(
+                fi_mean[mask],
+                distances[mask],
+                overlay_path,
+                f"FI cumulative distance profile | {model_name.upper()}",
+            )
+            _LOG.info("Saved FI distance overlay to %s", overlay_path)
+
+    summary_path = output_dir / "feature_importance_summary.json"
+    summary_path.write_text(json.dumps(summary_payload, indent=2))
+    _LOG.info("Wrote feature importance manifest to %s", summary_path)
+
+    duration = time.perf_counter() - start_wall
+    end_ts = datetime.now(timezone.utc).isoformat()
+    _LOG.info(
+        "Feature importance export complete | model=%s | duration=%.2fs | timestamp=%s",
+        model_name,
+        duration,
+        end_ts,
+    )
 
 try:
     import torch.nn as _torch_nn
@@ -101,18 +331,11 @@ def run_pipeline(config: PipelineConfig) -> Path:
     atac, rna = preprocess_modalities(atac, rna, config.training)
 
     target_chromosomes = config.chromosomes
-    force_all_chromosomes = False
     if target_chromosomes and len(target_chromosomes) == 1:
         token = target_chromosomes[0].strip().lower()
         if token in {"all", "genome-wide", "genome"}:
-            force_all_chromosomes = True
             target_chromosomes = None
-
-    if target_chromosomes is None and config.multi_output and not force_all_chromosomes:
-        target_chromosomes = ["chr19"]
-        _LOG.info("No chromosome filter specified; defaulting to chr19 for multi-output mode (override with --chromosomes)")
-    elif force_all_chromosomes:
-        _LOG.info("Multi-output mode requested across all chromosomes")
+            _LOG.info("Chromosome filter explicitly set to all/genome-wide")
 
     genes_all = parse_gtf(
         config.paths.gtf_path,
@@ -694,6 +917,17 @@ def _run_cellwise_pipeline(
                             model_dir / f"training_history_{metric}.png",
                             title=f"{model_name.upper()} | {metric.title()}",
                         )
+
+                if getattr(result, "feature_importances", None) is not None and getattr(result, "feature_names", None):
+                    _export_feature_importance_artifacts(
+                        model_dir,
+                        model_name,
+                        np.asarray(result.feature_importances, dtype=np.float64),
+                        list(result.feature_names),
+                        method=getattr(result, "feature_importance_method", None),
+                        gene_names=result.gene_names,
+                        feature_block_slices=getattr(result, "feature_block_slices", None),
+                    )
 
                 metric_payload = {"model": model_name, "num_genes": dataset.num_genes()}
                 for split in ("train", "val", "test"):

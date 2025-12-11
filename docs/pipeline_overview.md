@@ -7,6 +7,7 @@ This document summarizes the current end-to-end workflow for the single-cell gen
 - **AnnData inputs:** `combined_ATAC_qc.h5ad` and `combined_RNA_qc.h5ad` (stored in `data/raw/`) are loaded through `PathsConfig.from_base(...)`. Cell barcodes are aligned so paired ATAC/RNA observations remain synchronized.
 - **Reference annotations:** The GTF specified in `config.PathsConfig` (defaults to `data/reference/GCF_000001635.27_genomic.gtf`) provides TSS coordinates used in feature extraction.
 - **Training configuration:** `TrainingConfig` centralizes hyperparameters such as window size (±10 kb), bin size (500 bp), pseudobulk settings (20-cell groups, 10 PCA components), split ratios (70/15/15), history tracking, and group keys. Each CLI run receives a `run_name` so all outputs land in a dedicated directory.
+- **Chromosome filters:** Genome-wide is the default; pass `--chromosomes` (or set `config.chromosomes`) to restrict to specific contigs.
 - **Gene manifests:** Runs optionally accept a newline-delimited manifest (`--gene-manifest`). When present, every model consumes the same ordered gene list; otherwise genes can be filtered by chromosome or count thresholds at runtime.
 
 ## 2. Gene Selection Logic
@@ -40,7 +41,7 @@ To stabilize expression estimates we create pseudobulk observations per split:
 - Linear baselines: `ridge`, `elastic_net`, `lasso`, `ols`.
 - Kernel methods: `svr`.
 
-Multi-output training (predicting all genes simultaneously) is available through the `--multi-output` flag; otherwise the pipeline iterates per gene.
+Multi-output training (predicting all genes simultaneously) is the default; use `--per-gene` if you want to iterate one gene at a time.
 
 ## 6. Training, Evaluation & Metrics
 
@@ -91,5 +92,11 @@ Logs for each CLI run live in `output/logs/<run_name>.log`; Slurm jobs write to 
 1. Verify array tasks completed successfully and check aggregate metrics in `<run_name>/summary_metrics.csv`.
 2. Open `analysis/grn_results_analysis.ipynb`, adjust `RUN_INCLUDE_GLOBS` if necessary, and execute the notebook to regenerate per-gene test Pearson summaries, violin plots, RMSE comparisons, prediction-vs-truth scatters, and epoch curves.
 3. Commit regenerated figures/CSVs in `analysis/figs/` so published artifacts match the latest experiments.
+
+## 10. Feature Importance Artifacts
+
+- Torch-based multi-output runs (e.g., MLP/transformer) now emit: `feature_importances_mean.csv` (mean/std/median per feature plus TSS-relative metadata), `feature_importances_raw.npz` (compressed stack for reproducibility), `feature_importance_per_gene_summary.csv` (per-gene statistics and correlations vs. TSS distance), `feature_importance_mean.png`, and `feature_importance_vs_tss_distance.png` inside `models/<model>/`.
+- These outputs enable downstream correlation studies without re-running attribution; every feature row includes `gene_name`, `relative_start_bp`, and `distance_to_tss_kb` so plots can be regenerated directly from CSV.
+- Use `scripts/plot_feature_importance_vs_tss.py <run_dir> --model mlp --output analysis/figs/fi_mlp.png` to assemble a publication-ready panel (top features, importance vs. TSS scatter, per-gene correlation boxplot). The script gracefully skips panels if metadata is missing.
 
 With these steps the repository is ready for publication: preprocessing is documented, all models are accessible via CLI and Slurm, and downstream analysis is consolidated in a single notebook.

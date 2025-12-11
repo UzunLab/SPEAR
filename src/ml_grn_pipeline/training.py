@@ -225,6 +225,10 @@ class CellwiseModelResult:
     split_predictions: Dict[str, Dict[str, np.ndarray]]
     fitted_model: Optional[object] = None
     history: Optional[List[Dict[str, float]]] = None
+    feature_importances: Optional[np.ndarray] = None
+    feature_names: Optional[List[str]] = None
+    feature_importance_method: Optional[str] = None
+    feature_block_slices: Optional[List[Tuple[int, int]]] = None
 
 
 def prepare_data(dataset, config: TrainingConfig) -> PreparedData:
@@ -783,6 +787,126 @@ def train_model_for_gene(
     )
 
 
+def _compute_torch_feature_importance(
+    bundle: TorchModelBundle,
+    X_reference: np.ndarray,
+    y_reference: Optional[np.ndarray],
+    *,
+    device: torch.device,
+    max_samples: int = 2000,
+    batch_size: int = 256,
+    target_scaler: Optional[StandardScaler | MinMaxScaler] = None,
+) -> Optional[np.ndarray]:
+    """Estimate global feature importance via mean absolute input gradients with permutation fallback."""
+
+    X_ref = np.asarray(X_reference, dtype=np.float32)
+    if X_ref.size == 0:
+        return None
+
+    sample_limit = max_samples if max_samples and max_samples > 0 else None
+    if sample_limit is not None and X_ref.shape[0] > sample_limit:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(X_ref.shape[0], size=sample_limit, replace=False)
+        idx.sort()
+        X_ref = X_ref[idx]
+
+    model = bundle.model.to(device)
+    model.eval()
+
+    totals = np.zeros(X_ref.shape[1], dtype=np.float64)
+    count = 0
+
+    grad_success = False
+    try:
+        for start in range(0, X_ref.shape[0], batch_size):
+            batch = X_ref[start : start + batch_size]
+            tensor = torch.tensor(batch, device=device, dtype=torch.float32)
+            if bundle.reshape == "sequence":
+                tensor = tensor.reshape(tensor.shape[0], -1, 1)
+            tensor.requires_grad_(True)
+
+            model.zero_grad(set_to_none=True)
+            with torch.enable_grad():
+                outputs = model(tensor)
+                loss = outputs.sum()
+                loss.backward()
+
+            grads = tensor.grad
+            if grads is None:
+                continue
+            if bundle.reshape == "sequence":
+                grads = grads.reshape(grads.shape[0], -1)
+
+            grad_batch = grads.detach().abs().cpu().numpy()
+            totals += grad_batch.sum(axis=0)
+            count += grad_batch.shape[0]
+        if count > 0:
+            grad_success = True
+            return totals / float(count)
+    except Exception:
+        grad_success = False
+
+    if not grad_success and y_reference is not None:
+        return _compute_torch_permutation_importance(
+            bundle,
+            X_ref,
+            y_reference,
+            device=device,
+            target_scaler=target_scaler,
+            max_samples=max_samples,
+            batch_size=batch_size,
+        )
+    return None
+
+
+def _compute_torch_permutation_importance(
+    bundle: TorchModelBundle,
+    X_reference: np.ndarray,
+    y_reference: np.ndarray,
+    *,
+    device: torch.device,
+    target_scaler: Optional[StandardScaler | MinMaxScaler] = None,
+    max_samples: int = 500,
+    batch_size: int = 256,
+) -> Optional[np.ndarray]:
+    """Permutation importance on a sample subset using MSE delta."""
+
+    X_ref = np.asarray(X_reference, dtype=np.float32)
+    y_ref = np.asarray(y_reference, dtype=np.float64)
+    if X_ref.size == 0 or y_ref.size == 0:
+        return None
+
+    sample_limit = max_samples if max_samples and max_samples > 0 else None
+    if sample_limit is not None and X_ref.shape[0] > sample_limit:
+        rng = np.random.default_rng(13)
+        idx = rng.choice(X_ref.shape[0], size=sample_limit, replace=False)
+        idx.sort()
+        X_ref = X_ref[idx]
+        y_ref = y_ref[idx]
+
+    def _predict_unscaled(inputs: np.ndarray) -> np.ndarray:
+        tens = torch.tensor(inputs, device=device, dtype=torch.float32)
+        if bundle.reshape == "sequence":
+            tens = tens.reshape(tens.shape[0], -1, 1)
+        with torch.no_grad():
+            preds = bundle.model.to(device)(tens).cpu().numpy()
+        return _unscale_targets(target_scaler, preds)
+
+    base_pred = _predict_unscaled(X_ref)
+    base_mse = float(np.mean((base_pred - y_ref) ** 2))
+
+    importances = np.zeros(X_ref.shape[1], dtype=np.float64)
+    rng = np.random.default_rng(37)
+    for feat_idx in range(X_ref.shape[1]):
+        permuted = X_ref.copy()
+        rng.shuffle(permuted[:, feat_idx])
+        perm_pred = _predict_unscaled(permuted)
+        perm_mse = float(np.mean((perm_pred - y_ref) ** 2))
+        importances[feat_idx] = max(0.0, perm_mse - base_mse)
+
+    return importances
+
+
 def train_multi_output_model(
     dataset,
     model_name: str,
@@ -955,6 +1079,27 @@ def train_multi_output_model(
     )
     _log_resource_snapshot(f"train_multi_output:{model_name}:fit:end")
 
+    feature_importances: Optional[np.ndarray] = None
+    feature_importance_method: Optional[str] = None
+    if isinstance(model, TorchModelBundle):
+        try:
+            device = _select_device(config.device_preference)
+            feature_importances = _compute_torch_feature_importance(
+                model,
+                splits.X_val,
+                splits.y_val,
+                device=device,
+                max_samples=getattr(config, "feature_importance_samples", 2000),
+                batch_size=getattr(config, "feature_importance_batch_size", 256),
+                target_scaler=prepared.target_scaler,
+            )
+            if feature_importances is not None:
+                feature_importance_method = "input_gradient_abs_mean"
+        except Exception as exc:  # pragma: no cover - best-effort diagnostics
+            _LOG.warning("Failed to compute feature importances for %s: %s", model_name, exc)
+            feature_importances = None
+            feature_importance_method = None
+
     y_train_true = _ensure_2d(_unscale_targets(prepared.target_scaler, splits.y_train))
     y_val_true = _ensure_2d(_unscale_targets(prepared.target_scaler, splits.y_val))
     y_test_true = _ensure_2d(_unscale_targets(prepared.target_scaler, splits.y_test))
@@ -998,6 +1143,10 @@ def train_multi_output_model(
         split_predictions=split_predictions,
         fitted_model=fitted_model,
         history=history,
+        feature_importances=feature_importances,
+        feature_names=getattr(dataset, "feature_names", None),
+        feature_importance_method=feature_importance_method,
+        feature_block_slices=getattr(dataset, "feature_block_slices", None),
     )
 
 
