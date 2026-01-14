@@ -36,7 +36,7 @@ from .data import (
     select_genes,
 )
 from .logging_utils import ResourceUsageTracker, get_logger
-from .training import CellwiseModelResult, ModelResult, train_model_for_gene, train_multi_output_model
+from .training import CellwiseModelResult, ModelResult, train_model_for_gene, train_multi_output_model, get_resource_summary
 from . import predict
 from .visualization import (
     plot_feature_importance,
@@ -379,7 +379,8 @@ def run_pipeline(config: PipelineConfig) -> Path:
 
     if config.genes:
         found_names = {gene.gene_name for gene in genes}
-        missing = [name for name in config.genes if name not in found_names]
+        found_ids = {gene.gene_id for gene in genes}
+        missing = [name for name in config.genes if name not in found_names and name not in found_ids]
         if missing:
             raise RuntimeError(
                 "The following requested genes were not found in annotations: "
@@ -956,6 +957,26 @@ def _run_cellwise_pipeline(
                         metric_payload[key] = metrics.get(metric_name)
                 summary_records.append(metric_payload)
 
+                # Verify all critical files were written before logging completion
+                critical_files = [
+                    model_dir / "predictions_raw.csv",
+                    model_dir / "metrics_aggregate.csv",
+                ]
+                all_files_exist = all(f.exists() for f in critical_files)
+                if all_files_exist:
+                    _LOG.info(
+                        "✓ SUCCESS | Completed multi-output training | model=%s | genes=%d | all outputs saved & ready for analysis",
+                        model_name,
+                        dataset.num_genes(),
+                    )
+                else:
+                    missing = [f.name for f in critical_files if not f.exists()]
+                    _LOG.warning(
+                        "Training completed but some outputs missing | model=%s | missing=%s",
+                        model_name,
+                        ", ".join(missing),
+                    )
+
                 model_export_meta[model_name]["status"] = "succeeded"
                 if model_name not in model_config_snapshots and result.fitted_model is not None:
                     model_config_snapshots[model_name] = _capture_model_configuration(result.fitted_model)
@@ -977,6 +998,33 @@ def _run_cellwise_pipeline(
         overall_status = "succeeded"
         return run_dir
     finally:
+        # Log resource usage summary from entire run
+        try:
+            resource_summary = get_resource_summary()
+            if resource_summary["peak_rss_gib"] > 0 or resource_summary["peak_gpu_allocated_mb"] > 0:
+                summary_parts = []
+                if resource_summary["peak_rss_gib"] > 0:
+                    summary_parts.append(f"peak_rss={resource_summary['peak_rss_gib']:.2f} GiB")
+                if resource_summary["peak_cpu_pct"] > 0:
+                    summary_parts.append(f"peak_cpu={resource_summary['peak_cpu_pct']:.1f}%")
+                if resource_summary["peak_gpu_allocated_mb"] > 0:
+                    summary_parts.append(f"peak_gpu_allocated={resource_summary['peak_gpu_allocated_mb']:.0f} MB")
+                if resource_summary["peak_gpu_reserved_mb"] > 0:
+                    summary_parts.append(f"peak_gpu_reserved={resource_summary['peak_gpu_reserved_mb']:.0f} MB")
+                if resource_summary["peak_gpu_free_mb"] != float("inf") and resource_summary["peak_gpu_free_mb"] >= 0:
+                    summary_parts.append(f"min_gpu_free={resource_summary['peak_gpu_free_mb']:.0f} MB")
+                if resource_summary["max_gpu_devices"] > 0:
+                    summary_parts.append(f"gpu_devices={resource_summary['max_gpu_devices']}")
+                
+                if summary_parts:
+                    _LOG.info("═" * 80)
+                    _LOG.info("RESOURCE USAGE SUMMARY (peak values across entire run)")
+                    _LOG.info("═" * 80)
+                    _LOG.info("Run resource peaks | %s", " | ".join(summary_parts))
+                    _LOG.info("═" * 80)
+        except Exception:  # pragma: no cover
+            _LOG.debug("Failed to log resource summary", exc_info=True)
+        
         model_status_snapshot = {
             name: meta.get("status", "pending") for name, meta in model_export_meta.items()
         }
@@ -990,6 +1038,13 @@ def _run_cellwise_pipeline(
             )
         except Exception:  # pragma: no cover - diagnostics only
             _LOG.warning("Failed to update run status overview", exc_info=True)
+
+
+def _resolve_rna_index(name_to_idx: Dict[str, int], gene: GeneInfo) -> Optional[int]:
+    idx = name_to_idx.get(gene.gene_name)
+    if idx is not None:
+        return idx
+    return name_to_idx.get(gene.gene_id)
 
 
 def _genes_expressed_above_fraction(
@@ -1009,7 +1064,7 @@ def _genes_expressed_above_fraction(
     # Vectorized evaluation to avoid per-gene materialization of full columns
     lookup: List[Tuple[GeneInfo, int]] = []
     for gene in genes:
-        idx = name_to_idx.get(gene.gene_name)
+        idx = _resolve_rna_index(name_to_idx, gene)
         if idx is not None:
             lookup.append((gene, idx))
 
@@ -1097,11 +1152,11 @@ def _write_selected_genes(
     if not genes:
         return
     out_path = run_dir / "selected_genes.csv"
-    rows = ["gene_name,gene_id,chrom,expression_fraction"]
+    rows = ["gene_id,gene_name,chrom,expression_fraction"]
     expr_map = gene_expression_fraction or {}
     for gene in sorted(genes, key=lambda g: (g.gene_name.lower(), g.gene_id.lower())):
         frac = expr_map.get(gene.gene_name, float("nan"))
-        rows.append(f"{gene.gene_name},{gene.gene_id},{gene.chrom},{frac}")
+        rows.append(f"{gene.gene_id},{gene.gene_name},{gene.chrom},{frac}")
     out_path.write_text("\n".join(rows) + "\n")
     _LOG.info("Recorded selected gene list to %s", out_path)
 
@@ -1331,9 +1386,11 @@ def _persist_cellwise_model(
 
     try:
         if _torch_nn is not None and isinstance(model, _torch_nn.Module):
+            # Unwrap DataParallel to avoid 'module.' prefix in state dict keys
+            model_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
             state = {
-                "state_dict": model.state_dict(),
-                "model_class": model.__class__.__name__,
+                "state_dict": model_to_save.state_dict(),
+                "model_class": model_to_save.__class__.__name__,
                 "reshape": result.reshape,
             }
             torch.save(state, model_dir / "model.pt")
@@ -1433,13 +1490,20 @@ def _export_run_configuration(
     model_details: Dict[str, Any],
     extra_context: Optional[Dict[str, Any]] = None,
 ) -> None:
+    genes_payload: Optional[Sequence[str]] = config.genes
+    if extra_context:
+        for key in ("requested_genes", "gene_names"):
+            candidates = extra_context.get(key)
+            if isinstance(candidates, list) and candidates:
+                genes_payload = candidates
+                break
     payload: "OrderedDict[str, Any]" = OrderedDict()
     payload["model_configurations"] = _serialize_value(model_details)
     payload["pipeline_config"] = {
         "paths": _serialize_value(config.paths),
         "training": _serialize_value(config.training),
         "models": _serialize_value(config.models),
-        "genes": _serialize_value(config.genes),
+        "genes": _serialize_value(genes_payload),
         "chromosomes": _serialize_value(config.chromosomes),
         "max_genes": config.max_genes,
         "chunk_total": config.chunk_total,

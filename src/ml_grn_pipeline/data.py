@@ -314,12 +314,38 @@ def parse_gtf(gtf_path: Path, chromosomes: Optional[Sequence[str]] = None, gene_
     records: List[GeneInfo] = []
     target_chroms_raw = set(chromosomes) if chromosomes else None
     target_chroms_norm = {_normalize_chrom_name(ch) for ch in target_chroms_raw} if target_chroms_raw else None
+    fallback_name_count = 0
+
+    def _strip_gene_version(gene_id: str) -> str:
+        return gene_id.split(".", 1)[0] if "." in gene_id else gene_id
+
+    def _is_ensembl_like(value: str) -> bool:
+        return value.upper().startswith("ENS")
+
+    def _pick_display_name(
+        gene_name_attr: Optional[str],
+        name_attr: Optional[str],
+        gene_attr: Optional[str],
+        fallback: str,
+    ) -> str:
+        for candidate in (gene_name_attr, gene_attr, name_attr):
+            if candidate and not _is_ensembl_like(candidate):
+                return candidate
+        for candidate in (gene_name_attr, gene_attr, name_attr):
+            if candidate:
+                return candidate
+        return fallback
+
     if gene_names:
         target_genes = set(gene_names)
+        target_genes_norm = {_strip_gene_version(g) for g in gene_names}
         target_genes_lower = {g.lower() for g in gene_names}
+        target_genes_lower_norm = {g.lower() for g in target_genes_norm}
     else:
         target_genes = None
+        target_genes_norm = set()
         target_genes_lower = set()
+        target_genes_lower_norm = set()
 
     with opener(gtf_path, "rt") as handle:
         for line in handle:
@@ -335,17 +361,27 @@ def parse_gtf(gtf_path: Path, chromosomes: Optional[Sequence[str]] = None, gene_
             if target_chroms_raw and seqname not in target_chroms_raw and chrom_norm not in target_chroms_norm:
                 continue
             attr_map = _parse_gtf_attributes(attributes)
-            gene_name = attr_map.get("gene_name") or attr_map.get("Name") or attr_map.get("gene")
-            gene_id = attr_map.get("gene_id") or attr_map.get("ID")
-            if gene_name is None or gene_id is None:
+            gene_name_attr = attr_map.get("gene_name")
+            name_attr = attr_map.get("Name")
+            gene_attr = attr_map.get("gene")
+            gene_id_raw = attr_map.get("gene_id") or attr_map.get("ID")
+            if gene_id_raw is None:
                 continue
-            if target_genes and (
-                gene_name not in target_genes
-                and gene_id not in target_genes
-                and gene_name.lower() not in target_genes_lower
-                and gene_id.lower() not in target_genes_lower
-            ):
-                continue
+            gene_id = _strip_gene_version(gene_id_raw)
+            gene_name_raw = gene_name_attr or name_attr or gene_attr
+            gene_name = _pick_display_name(gene_name_attr, name_attr, gene_attr, gene_id)
+            if gene_name == gene_id and gene_name_raw is None:
+                fallback_name_count += 1
+            if target_genes:
+                candidates = {c for c in (gene_name_raw, gene_name, gene_id_raw, gene_id) if c}
+                candidates_lower = {c.lower() for c in candidates}
+                if not (
+                    candidates & target_genes
+                    or candidates & target_genes_norm
+                    or candidates_lower & target_genes_lower
+                    or candidates_lower & target_genes_lower_norm
+                ):
+                    continue
             start_i = int(start)
             end_i = int(end)
             strand_val = strand if strand in {"+", "-"} else "+"
@@ -355,6 +391,11 @@ def parse_gtf(gtf_path: Path, chromosomes: Optional[Sequence[str]] = None, gene_
             )
     if target_genes and len(records) == 0:
         raise ValueError("None of the requested genes were found in the provided GTF file")
+    if fallback_name_count:
+        _LOG.warning(
+            "GTF entries without gene names: %d (falling back to Ensembl IDs)",
+            fallback_name_count,
+        )
     _LOG.info("Parsed %d gene annotations", len(records))
     return records
 
@@ -387,6 +428,13 @@ def select_genes(
     return filtered
 
 
+def _resolve_gene_index(name_to_idx: Dict[str, int], gene: GeneInfo) -> Optional[int]:
+    idx = name_to_idx.get(gene.gene_name)
+    if idx is not None:
+        return idx
+    return name_to_idx.get(gene.gene_id)
+
+
 def build_gene_dataset(
     gene: GeneInfo,
     atac: ad.AnnData,
@@ -395,10 +443,10 @@ def build_gene_dataset(
     training: TrainingConfig,
 ) -> GeneDataset:
     rna_var = np.asarray(rna.var_names).astype(str)
-    try:
-        gene_idx = int(np.where(rna_var == gene.gene_name)[0][0])
-    except IndexError as exc:
-        raise ValueError(f"Gene {gene.gene_name} not found in RNA matrix") from exc
+    name_to_idx = {name: idx for idx, name in enumerate(rna_var)}
+    gene_idx = _resolve_gene_index(name_to_idx, gene)
+    if gene_idx is None:
+        raise ValueError(f"Gene {gene.gene_name} not found in RNA matrix")
 
     if training.rna_expression_layer and training.rna_expression_layer in rna.layers:
         expression_matrix = rna.layers[training.rna_expression_layer]
@@ -457,6 +505,89 @@ def build_gene_dataset(
     )
 
 
+def _deduplicate_genes_by_rna_match(
+    genes: List[GeneInfo],
+    rna_var_names: np.ndarray,
+) -> List[GeneInfo]:
+    """
+    Remove duplicate gene entries, prioritizing those whose gene_id is in the RNA data.
+    
+    When a GTF file has multiple entries with the same gene_name (e.g., IL3RA on chrX and chrY),
+    this function keeps only the entry whose gene_id matches an entry in the RNA data.
+    
+    Tie-breaking for multiple RNA matches:
+    - Prefer canonical autosomes (chr1-chr22) over sex/mito chromosomes
+    - Within same chromosome category, sort by chromosome name lexicographically
+    - Final tie-breaker: prefer upstream TSS (lower position on + strand, higher position on - strand)
+    """
+    from collections import defaultdict
+    
+    def _chromosome_sort_key(chrom: str) -> tuple:
+        """Return sort key prioritizing canonical autosomes."""
+        # Extract numeric part for sorting (chr1, chr2, ..., chr22)
+        if chrom.startswith("chr"):
+            suffix = chrom[3:]
+            if suffix.isdigit():
+                # Canonical autosome: sort by number
+                return (0, int(suffix), chrom)
+            elif suffix in {"X", "Y"}:
+                # Sex chromosome: sort after autosomes
+                return (1, 0, chrom)
+            elif suffix in {"M", "MT"}:
+                # Mitochondrial: sort last
+                return (2, 0, chrom)
+        # Unknown format: sort to end
+        return (3, 0, chrom)
+    
+    rna_var_set = set(rna_var_names.astype(str))
+    # Cache membership so duplicate gene_name groups do not repeatedly probe the RNA set
+    gene_id_in_rna = {gene.gene_id: gene.gene_id in rna_var_set for gene in genes}
+    name_to_genes = defaultdict(list)
+    
+    # Group genes by gene_name
+    for gene in genes:
+        name_to_genes[gene.gene_name].append(gene)
+    
+    deduplicated: List[GeneInfo] = []
+    for gene_name, gene_list in name_to_genes.items():
+        if len(gene_list) == 1:
+            # No duplicates, keep as is
+            deduplicated.append(gene_list[0])
+        else:
+            # Multiple entries with same gene_name - prioritize RNA matches
+            matches_in_rna = [g for g in gene_list if gene_id_in_rna.get(g.gene_id, False)]
+            if matches_in_rna:
+                # Sort multiple matches by chromosome (canonical first) then TSS position for determinism
+                sorted_matches = sorted(
+                    matches_in_rna,
+                    key=lambda g: (
+                        _chromosome_sort_key(g.chrom),
+                        g.tss if g.strand != "-" else -g.tss,
+                    ),
+                )
+                selected = sorted_matches[0]
+                deduplicated.append(selected)
+                if len(matches_in_rna) > 1:
+                    _LOG.warning(
+                        "Gene %s has %d entries with gene_id in RNA data; selecting %s on %s (TSS=%d) over %s",
+                        gene_name,
+                        len(matches_in_rna),
+                        selected.gene_id,
+                        selected.chrom,
+                        selected.tss,
+                        ", ".join(f"{m.gene_id} ({m.chrom})" for m in sorted_matches[1:])
+                    )
+            else:
+                # None match RNA data, keep first entry (will be skipped later)
+                deduplicated.append(gene_list[0])
+                _LOG.debug(
+                    "Gene %s has %d GTF entries but none match RNA data; using %s",
+                    gene_name, len(gene_list), gene_list[0].gene_id
+                )
+    
+    return deduplicated
+
+
 def build_cellwise_dataset(
     genes: List[GeneInfo],
     atac: ad.AnnData,
@@ -469,6 +600,11 @@ def build_cellwise_dataset(
 
     cell_ids = np.asarray(rna.obs_names).astype(str)
     rna_var = np.asarray(rna.var_names).astype(str)
+    
+    # Deduplicate genes, prioritizing those in RNA data
+    genes = _deduplicate_genes_by_rna_match(genes, rna_var)
+    
+    name_to_idx = {name: idx for idx, name in enumerate(rna_var)}
     if training.group_key and training.group_key in rna.obs.columns:
         group_labels = rna.obs[training.group_key].astype(str).to_numpy()
     else:
@@ -494,9 +630,8 @@ def build_cellwise_dataset(
     offset = 0
 
     for gene in genes:
-        try:
-            gene_idx = int(np.where(rna_var == gene.gene_name)[0][0])
-        except IndexError:
+        gene_idx = _resolve_gene_index(name_to_idx, gene)
+        if gene_idx is None:
             _LOG.warning("Gene %s not found in RNA matrix; skipping", gene.gene_name)
             continue
 

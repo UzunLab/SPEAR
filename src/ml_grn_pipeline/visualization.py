@@ -348,7 +348,7 @@ def plot_importance_distance_scatter(
     order = np.argsort(dist)
     dist_sorted = dist[order]
     imp_sorted = imp[order]
-    rolling = pd.Series(imp_sorted).rolling(window=rolling_window, min_periods=10).mean()
+    rolling = pd.Series(imp_sorted).rolling(window=rolling_window, min_periods=10).median()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(7, 5))
@@ -358,7 +358,7 @@ def plot_importance_distance_scatter(
         y=rolling,
         color="#d62728",
         linewidth=1.4,
-        label="Rolling mean",
+        label="Rolling median",
     )
     plt.axvline(0.0, linestyle="--", color="#444", linewidth=1.0, alpha=0.7)
     if max_distance_kb is not None:

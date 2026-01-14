@@ -131,6 +131,17 @@ The following identifiers can be supplied to `--models` (and combined arbitraril
 - `svr`
 
 Each mapping to a display label is tracked in `scripts/model_name_lookup.tsv` and consumed by the plotting notebook.
+SVR defaults to a linear kernel with configurable hyperparameters via `TrainingConfig.svr_*`.
+
+### Utilities and scripts
+
+- `scripts/preflight_check.py`: quick readiness probe (env, packages, data paths, GTF, SLURM scripts). Run `python scripts/preflight_check.py --help` for options.
+- `scripts/preprocess_endothelial.py`: RDS→AnnData conversion and QC for the endothelial dataset (barcode alignment, MT filtering, min genes/cells).
+
+### Optional dependency sets
+
+- Dev tooling: `pip install -r requirements-dev.txt` (ruff, black, pytest).
+- Notebook work: `pip install -r requirements-notebook.txt` (JupyterLab, ipykernel).
 
 ## Preprocessing Details
 

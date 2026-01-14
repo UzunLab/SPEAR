@@ -51,6 +51,21 @@ def parse_args() -> argparse.Namespace:
             "Optional output file path; defaults to output/results/grn_regression_cellwise/selected_genes_100_precomputed.csv"
         ),
     )
+    parser.add_argument(
+        "--rna-path",
+        type=Path,
+        help="Optional RNA AnnData path to override the default resolved via base-dir",
+    )
+    parser.add_argument(
+        "--atac-path",
+        type=Path,
+        help="Optional ATAC AnnData path to override the default resolved via base-dir",
+    )
+    parser.add_argument(
+        "--gtf-path",
+        type=Path,
+        help="Optional GTF path to override the default annotation in PathsConfig",
+    )
     return parser.parse_args()
 
 
@@ -86,7 +101,11 @@ def filter_candidates(
     *,
     min_fraction: float,
 ) -> List[GeneInfo]:
-    return [gene for gene in genes if fractions.get(gene.gene_name, 0.0) >= min_fraction]
+    return [
+        gene
+        for gene in genes
+        if fractions.get(gene.gene_name, fractions.get(gene.gene_id, 0.0)) >= min_fraction
+    ]
 
 
 def sample_genes(
@@ -110,7 +129,7 @@ def write_manifest(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["gene_name,gene_id,chrom,expression_fraction"]
     for gene in sorted(genes, key=lambda g: g.gene_name):
-        frac = fractions.get(gene.gene_name, float("nan"))
+        frac = fractions.get(gene.gene_name, fractions.get(gene.gene_id, float("nan")))
         lines.append(f"{gene.gene_name},{gene.gene_id},{gene.chrom},{frac}")
     output_path.write_text("\n".join(lines) + "\n")
 
@@ -126,10 +145,25 @@ def main() -> None:
     min_expression = args.min_expression if args.min_expression is not None else training.min_expression
     random_state = args.random_state if args.random_state is not None else training.random_state
 
+    # Set the random seed for reproducibility, using --random-state if provided or falling back to training config
+    np.random.seed(random_state)
+
+    if args.rna_path is not None:
+        paths = PathsConfig(
+            base_dir=paths.base_dir,
+            atac_path=args.atac_path or paths.atac_path,
+            rna_path=args.rna_path,
+            gtf_path=paths.gtf_path,
+            output_dir=paths.output_dir,
+            logs_dir=paths.logs_dir,
+            figures_dir=paths.figures_dir,
+        )
+
     rna = load_rna_matrix(paths)
     fractions, _ = compute_expression_fraction(rna, min_expression=min_expression)
 
-    genes_all = parse_gtf(paths.gtf_path)
+    gtf_path = args.gtf_path if args.gtf_path is not None else paths.gtf_path
+    genes_all = parse_gtf(gtf_path)
     selected_pool = select_genes(genes_all, requested_genes=None, max_genes=None)
     candidates = filter_candidates(selected_pool, fractions, min_fraction=min_fraction)
 

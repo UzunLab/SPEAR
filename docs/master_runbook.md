@@ -34,6 +34,7 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
 - Install Conda or Mamba if not already available.
 - Create the environment: `conda env create -f environment.yml` (or `mamba env create ...`).
 - Activate with `conda activate grn_ml_env_py311` and install the project in editable mode (`pip install -e .`) so local modifications are picked up.
+- Optional: install dev tools (`pip install -r requirements-dev.txt`) and notebook tooling (`pip install -r requirements-notebook.txt`) if you plan to lint, test, or run notebooks locally.
 
 ### Stage 1 - Computer science perspective
 
@@ -72,6 +73,7 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
 - Read `docs/pipeline_overview.md` to understand component boundaries (data loaders, feature builders, model zoo, reporting).
 - Consult `docs/config_reference.md` for every CLI flag and environment variable supported by `src`.
 - Determine the gene manifest(s), chromosome scope, window size, and training overrides for your planned run; record these in `todo.md` or a run sheet.
+- For SVR runs, note that `TrainingConfig` exposes `svr_kernel`, `svr_C`, `svr_epsilon`, `svr_max_iter`, and `svr_tol` with defaults documented in `docs/config_reference.md`.
 
 ### Stage 3 - Computer science perspective
 
@@ -123,6 +125,7 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
   `python -m ml_grn_pipeline.cli --models mlp --gene-manifest data/manifests/smoke_genes.txt --device cpu --k-folds 2 --epochs 2 --run-name dev_smoke_local`
 - Confirm outputs land in `output/results/grn_regression_cellwise/dev_smoke_local/`.
 - Inspect logs for import errors, missing data references, or serialization issues.
+- You can also run `python scripts/preflight_check.py` to validate environment, package availability, data paths (AnnData/GTF), and SLURM scripts before queueing jobs.
 
 ### Stage 6 - Computer science perspective
 

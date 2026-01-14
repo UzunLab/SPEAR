@@ -4,6 +4,7 @@ import json
 import logging
 import random
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -24,6 +25,26 @@ from .config import TrainingConfig
 from .metrics import regression_metrics
 from .models import TorchModelBundle, build_model
 from .logging_utils import get_logger
+
+# Suppress specific warnings that are informational only
+warnings.filterwarnings('ignore', message='.*CuDNN issue.*nvrtc.so.*', category=UserWarning)
+warnings.filterwarnings('ignore', message='.*Ill-conditioned matrix.*', category=RuntimeWarning)
+
+
+# Global resource tracker for peak values across entire run
+_RESOURCE_TRACKER = {
+    "peak_rss_gib": 0.0,
+    "peak_cpu_pct": 0.0,
+    "peak_gpu_allocated_mb": 0.0,
+    "peak_gpu_reserved_mb": 0.0,
+    "peak_gpu_free_mb": float("inf"),
+    "max_gpu_devices": 0,
+}
+
+
+def get_resource_summary() -> dict:
+    """Return dictionary of peak resource values accumulated during the run."""
+    return _RESOURCE_TRACKER.copy()
 
 
 try:  # psutil is optional; best-effort resource visibility
@@ -93,6 +114,14 @@ def _reshape_tensor_for_model(tens: torch.Tensor, reshape: str | None) -> torch.
 _LOG = get_logger(__name__)
 
 
+def _wrap_model_for_multi_gpu(model: nn.Module, device: torch.device) -> nn.Module:
+    """Wrap model in DataParallel if multiple GPUs are available and device is CUDA."""
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        _LOG.info("Wrapping model in DataParallel for %d GPUs", torch.cuda.device_count())
+        return nn.DataParallel(model)
+    return model
+
+
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -114,10 +143,12 @@ def _log_resource_snapshot(label: str) -> None:
     try:
         rss_bytes = process.memory_info().rss
         rss_gib = rss_bytes / (1024 ** 3)
+        _RESOURCE_TRACKER["peak_rss_gib"] = max(_RESOURCE_TRACKER["peak_rss_gib"], rss_gib)
     except Exception:  # pragma: no cover - defensive fallback
         rss_gib = float("nan")
     try:
         cpu_pct = process.cpu_percent(interval=None)
+        _RESOURCE_TRACKER["peak_cpu_pct"] = max(_RESOURCE_TRACKER["peak_cpu_pct"], cpu_pct)
     except Exception:  # pragma: no cover - defensive fallback
         cpu_pct = float("nan")
     _LOG.info(
@@ -126,6 +157,56 @@ def _log_resource_snapshot(label: str) -> None:
         rss_gib,
         cpu_pct,
     )
+
+
+def _log_gpu_memory_snapshot(label: str) -> None:
+    """Log GPU memory usage if CUDA is available.
+    
+    Captures:
+        - Reserved: Total GPU memory allocated by PyTorch
+        - Allocated: Currently in-use GPU memory
+        - Cached: Memory held by caching allocator (available for reuse)
+        - Free: Unallocated device memory
+    
+    Tracks peak values globally for final summary.
+    """
+    if not torch.cuda.is_available():
+        return
+    
+    try:
+
+        torch.cuda.synchronize()
+        
+        allocated_mb = torch.cuda.memory_allocated() / (1024 ** 2)
+        reserved_mb = torch.cuda.memory_reserved() / (1024 ** 2)
+        
+        # Peak memory since last reset
+        peak_allocated_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        
+        # Available on device
+        device_count = torch.cuda.device_count()
+        total_device_mb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+        free_device_mb = total_device_mb - reserved_mb
+        
+        # Update tracker
+        _RESOURCE_TRACKER["peak_gpu_allocated_mb"] = max(_RESOURCE_TRACKER["peak_gpu_allocated_mb"], peak_allocated_mb)
+        _RESOURCE_TRACKER["peak_gpu_reserved_mb"] = max(_RESOURCE_TRACKER["peak_gpu_reserved_mb"], reserved_mb)
+        _RESOURCE_TRACKER["peak_gpu_free_mb"] = min(_RESOURCE_TRACKER["peak_gpu_free_mb"], free_device_mb)
+        _RESOURCE_TRACKER["max_gpu_devices"] = max(_RESOURCE_TRACKER["max_gpu_devices"], device_count)
+        
+        _LOG.info(
+            "GPU memory snapshot | %s | allocated=%.0f MB (peak=%.0f MB) | reserved=%.0f MB | "
+            "free=%.0f MB / %.0f MB total | devices=%d",
+            label,
+            allocated_mb,
+            peak_allocated_mb,
+            reserved_mb,
+            free_device_mb,
+            total_device_mb,
+            device_count,
+        )
+    except Exception:  # pragma: no cover - defensive fallback
+        _LOG.debug("Failed to capture GPU memory snapshot", exc_info=True)
 
 
 def _config_cache_key(config: TrainingConfig, scope: str) -> str:
@@ -253,6 +334,7 @@ def prepare_data(dataset, config: TrainingConfig) -> PreparedData:
 
     _seed_everything(config.random_state)
 
+    _prep_start = time.perf_counter()
     _log_resource_snapshot("prepare_data:start")
     # Use genes[0].gene_name if available, else fallback to 'unknown'.
     if hasattr(dataset, "genes") and dataset.genes and hasattr(dataset.genes[0], "gene_name"):
@@ -470,11 +552,12 @@ def prepare_data(dataset, config: TrainingConfig) -> PreparedData:
         y_test_raw=y_test_raw,
     )
     _LOG.info(
-        "Prepared gene-wise splits | train=%d | val=%d | test=%d | features=%d",
+        "Prepared gene-wise splits | train=%d | val=%d | test=%d | features=%d | %.2fs",
         X_train.shape[0],
         X_val.shape[0],
         X_test.shape[0],
         X_train.shape[1],
+        time.perf_counter() - _prep_start,
     )
     _log_resource_snapshot("prepare_data:end")
     return PreparedData(splits=splits, feature_scaler=feature_scaler, target_scaler=target_scaler)
@@ -488,6 +571,7 @@ def prepare_cellwise_data(dataset, config: TrainingConfig) -> PreparedCellwiseDa
         dataset.y.shape[1] if dataset.y.ndim > 1 else 1,
     )
     _log_resource_snapshot("prepare_cellwise_data:start")
+    _cellwise_prep_start = time.perf_counter()
 
     X = dataset.X.astype(np.float32)
     Y = dataset.y.astype(np.float32)
@@ -695,11 +779,12 @@ def prepare_cellwise_data(dataset, config: TrainingConfig) -> PreparedCellwiseDa
         y_test_raw=Y_test_raw,
     )
     _LOG.info(
-        "Prepared cell-wise splits | train=%d | val=%d | test=%d | features=%d",
+        "Prepared cell-wise splits | train=%d | val=%d | test=%d | features=%d | %.2fs",
         X_train.shape[0],
         X_val.shape[0],
         X_test.shape[0],
         X_train.shape[1],
+        time.perf_counter() - _cellwise_prep_start,
     )
     _log_resource_snapshot("prepare_cellwise_data:end")
     return PreparedCellwiseData(splits=splits, feature_scaler=feature_scaler, target_scaler=target_scaler)
@@ -718,7 +803,7 @@ def train_model_for_gene(
     if isinstance(cache_dict, dict) and cache_key in cache_dict:
         prepared = cache_dict[cache_key]  # type: ignore[assignment]
         if hasattr(dataset, "gene"):
-            _LOG.debug("Reusing cached prepared data for gene %s", getattr(dataset.gene, "gene_name", "unknown"))
+            _LOG.info("Reusing cached prepared data for gene %s", getattr(dataset.gene, "gene_name", "unknown"))
     else:
         prepared = prepare_data(dataset, config)
         if isinstance(cache_dict, dict):
@@ -907,7 +992,7 @@ def _compute_torch_feature_importance(
         return None
 
 
-    sample_limit = max_samples if max_samples and max_samples > 0 else None
+    sample_limit = max_samples if max_samples is not None and max_samples > 0 else None
 
     if sample_limit is not None and X_ref.shape[0] > sample_limit:
         rng = np.random.default_rng(42)
@@ -924,6 +1009,7 @@ def _compute_torch_feature_importance(
         y_ref = y_ref[:min_len]
 
     model = bundle.model.to(device)
+    model = _wrap_model_for_multi_gpu(model, device)
     model.eval()
 
     totals = np.zeros(X_ref.shape[1], dtype=np.float64)
@@ -988,7 +1074,7 @@ def _compute_torch_permutation_importance(
     if X_ref.size == 0 or y_ref.size == 0:
         return None
 
-    sample_limit = max_samples if max_samples and max_samples > 0 else None
+    sample_limit = max_samples if max_samples is not None and max_samples > 0 else None
     if sample_limit is not None and X_ref.shape[0] > sample_limit:
         rng = np.random.default_rng(13)
         idx = rng.choice(X_ref.shape[0], size=sample_limit, replace=False)
@@ -1000,7 +1086,9 @@ def _compute_torch_permutation_importance(
         tens = torch.tensor(inputs, device=device, dtype=torch.float32)
         tens = _reshape_tensor_for_model(tens, bundle.reshape)
         with torch.no_grad():
-            preds = bundle.model.to(device)(tens).cpu().numpy()
+            model_device = bundle.model.to(device)
+            model_device = _wrap_model_for_multi_gpu(model_device, device)
+            preds = model_device(tens).cpu().numpy()
         return _unscale_targets(target_scaler, preds)
 
     base_pred = _predict_unscaled(X_ref)
@@ -1030,7 +1118,7 @@ def train_multi_output_model(
     prepared: PreparedCellwiseData
     if isinstance(cache_dict, dict) and cache_key in cache_dict:
         prepared = cache_dict[cache_key]  # type: ignore[assignment]
-        _LOG.debug(
+        _LOG.info(
             "Reusing cached prepared cell-wise data for %d genes",
             len(getattr(dataset, "genes", [])),
         )
@@ -1184,7 +1272,7 @@ def train_multi_output_model(
 
     fit_duration = time.perf_counter() - fit_start
     _LOG.info(
-        "Completed full fit | model=%s | duration=%.2fs",
+        "Completed full fit | model=%s | duration=%.2fs | (exporting outputs...)",
         model_name,
         fit_duration,
     )
@@ -1192,7 +1280,10 @@ def train_multi_output_model(
 
     feature_importances: Optional[np.ndarray] = None
     feature_importance_method: Optional[str] = None
-    if isinstance(model, TorchModelBundle):
+    if isinstance(model, TorchModelBundle) and config.enable_feature_importance:
+        fi_start = time.perf_counter()
+        fi_max_samples = config.feature_importance_samples
+        fi_batch_size = config.feature_importance_batch_size
         try:
             device = _select_device(config.device_preference)
             feature_importances = _compute_torch_feature_importance(
@@ -1200,8 +1291,8 @@ def train_multi_output_model(
                 splits.X_val,
                 splits.y_val,
                 device=device,
-                max_samples=getattr(config, "feature_importance_samples", 2000),
-                batch_size=getattr(config, "feature_importance_batch_size", 256),
+                max_samples=fi_max_samples if fi_max_samples is not None else splits.X_val.shape[0],
+                batch_size=fi_batch_size,
                 target_scaler=prepared.target_scaler,
             )
             if feature_importances is not None:
@@ -1210,6 +1301,17 @@ def train_multi_output_model(
             _LOG.warning("Failed to compute feature importances for %s: %s", model_name, exc)
             feature_importances = None
             feature_importance_method = None
+        finally:
+            fi_elapsed = time.perf_counter() - fi_start
+            eff_samples = int(min(splits.X_val.shape[0], fi_max_samples) if fi_max_samples is not None else splits.X_val.shape[0])
+            _LOG.info(
+                "Feature importance completed | model=%s | method=%s | samples=%d | batch_size=%d | %.2fs",
+                model_name,
+                feature_importance_method or "n/a",
+                eff_samples,
+                fi_batch_size,
+                fi_elapsed,
+            )
 
     y_train_true = _ensure_2d(_unscale_targets(prepared.target_scaler, splits.y_train))
     y_val_true = _ensure_2d(_unscale_targets(prepared.target_scaler, splits.y_val))
@@ -1277,6 +1379,7 @@ def _fit_torch_model(
 ) -> Tuple[nn.Module, np.ndarray, Optional[List[Dict[str, float]]]]:
     device = _select_device(config.device_preference)
     model = bundle.model.to(device)
+    model = _wrap_model_for_multi_gpu(model, device)
 
     y_train_arr = np.asarray(y_train)
     target_dim = y_train_arr.shape[1] if y_train_arr.ndim > 1 else 1
@@ -1358,6 +1461,7 @@ def _fit_torch_model(
         config.epochs,
         batch_size,
     )
+    _log_gpu_memory_snapshot("Before training start")
 
     for epoch in range(config.epochs):
         model.train()
@@ -1468,6 +1572,7 @@ def _fit_torch_model(
         if should_stop:
             break
 
+    _log_gpu_memory_snapshot("After training complete")
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
@@ -1526,13 +1631,17 @@ def _select_device(device_preference: str) -> torch.device:
     pref = (device_preference or "cuda").lower()
     if pref == "auto":
         if torch.cuda.is_available():
-            _LOG.debug("Auto-selected CUDA device")
-            return torch.device("cuda")
+            _LOG.info("Auto-selected CUDA device")
+            device = torch.device("cuda")
+            _log_gpu_memory_snapshot("CUDA device selected")
+            return device
         _LOG.warning("CUDA not available; auto device falling back to CPU")
         return torch.device("cpu")
     if pref == "cuda":
         if torch.cuda.is_available():
-            return torch.device("cuda")
+            device = torch.device("cuda")
+            _log_gpu_memory_snapshot("CUDA device selected (explicit)")
+            return device
         _LOG.warning("CUDA requested but unavailable; falling back to CPU")
         return torch.device("cpu")
     return torch.device("cpu")

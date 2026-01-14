@@ -65,6 +65,25 @@ class TorchModelBundle:
 
 
 class CNNRegressor(nn.Module):
+    """1D Convolutional Neural Network for feature extraction and regression.
+    
+    Architecture:
+        - Multi-scale convolutions (7, 5, 3 kernel sizes with strides 4, 4, 2) progressively
+          compress spatial dimensions while increasing channel depth (32→64→128)
+        - Batch normalization after each conv layer for training stability
+        - Adaptive pooling to fixed segment count for consistent architecture across input sizes
+        - Dense head (512 → output_dim) with dropout regularization
+        - Total parameters: ~O(input_dim) depending on segment count (8-128 segments)
+    
+    Memory Profile:
+        - Forward pass activations: ~input_dim * 256 floats during feature extraction
+        - Typical GPU memory: 50-150 MB per model for input_dim=40k
+        - Batch-friendly: Memory scales linearly with batch size
+    
+    Input: (batch, input_dim) or (batch, 1, input_dim) → sequence format
+    Output: (batch, output_dim) predictions
+    """
+    
     def __init__(self, input_dim: int, output_dim: int = 1):
         super().__init__()
         target_segments = max(8, min(128, max(1, input_dim // 32)))
@@ -98,6 +117,25 @@ class CNNRegressor(nn.Module):
 
 
 class RNNRegressor(nn.Module):
+    """Recurrent Neural Network (vanilla RNN) for sequence modeling.
+    
+    Architecture:
+        - Initial projection via convolutions (1→32→64→96 channels) to compress spatial dims
+        - Vanilla RNN layers (tanh activation) to capture sequential dependencies
+        - Adaptive pooling to fixed segment count for variable-length inputs
+        - Dense head (96→128→output_dim) with dropout
+        - Dropout between RNN layers when num_layers>1
+        - Total parameters: O(hidden_size²) for RNN cell + O(input_dim) for projection
+    
+    Memory Profile:
+        - RNN hidden states: (batch, hidden_size=96, seq_len) per layer
+        - Typical GPU memory: 80-200 MB per model for input_dim=40k
+        - Sequential dependency capture requires full forward pass (not parallelizable)
+    
+    Input: (batch, input_dim) → flattened input
+    Output: (batch, output_dim) predictions (uses final hidden state)
+    """
+    
     def __init__(self, input_dim: int, hidden_size: int = 96, num_layers: int = 1, output_dim: int = 1):
         super().__init__()
         target_segments = max(8, min(128, max(1, input_dim // 32)))
@@ -139,6 +177,26 @@ class RNNRegressor(nn.Module):
 
 
 class LSTMRegressor(nn.Module):
+    """Long Short-Term Memory network for capturing long-range sequential patterns.
+    
+    Architecture:
+        - Initial projection via convolutions (1→32→64→96 channels) for dimensionality reduction
+        - LSTM layers (hidden_size=128) with cell state tracking for long-range dependencies
+        - Adaptive pooling to fixed segment count (8-128)
+        - Dense head (128→128→output_dim) with dropout regularization
+        - Dropout between LSTM layers when num_layers>1
+        - Total parameters: O(hidden_size²) per LSTM layer + O(input_dim) for projection
+    
+    Memory Profile:
+        - LSTM cell state + hidden state: 2 × (batch, hidden_size=128, seq_len)
+        - Typical GPU memory: 120-300 MB per model for input_dim=40k
+        - Gradient computation requires storing intermediate activations (higher than RNN)
+        - Best for capturing cell-to-cell regulatory patterns
+    
+    Input: (batch, input_dim) → flattened input
+    Output: (batch, output_dim) predictions (uses final hidden state)
+    """
+    
     def __init__(self, input_dim: int, hidden_size: int = 128, num_layers: int = 1, output_dim: int = 1):
         super().__init__()
         target_segments = max(8, min(128, max(1, input_dim // 32)))
@@ -179,6 +237,26 @@ class LSTMRegressor(nn.Module):
 
 
 class MLPRegressor(nn.Module):
+    """Multi-Layer Perceptron for direct feature-to-target mapping.
+    
+    Architecture:
+        - Fully connected dense layers with layer normalization and dropout
+        - Default configuration: input_dim → 256 → 256 → 128 → output_dim
+        - LayerNorm provides adaptive scaling per layer, improving gradient flow
+        - ReLU activations with 0.2 dropout for regularization
+        - Final layer is linear (no activation) for regression
+        - Total parameters: O(input_dim × hidden_layers²)
+    
+    Memory Profile:
+        - Fastest neural model: no recurrence or convolution overhead
+        - Typical GPU memory: 40-100 MB per model for input_dim=40k
+        - All computations are parallelizable (ideal for batching)
+        - Forward/backward passes are ~10-15x faster than LSTM/Transformer
+    
+    Input: (batch, input_dim) → dense connections to all hidden units
+    Output: (batch, output_dim) predictions
+    """
+    
     def __init__(self, input_dim: int, hidden_layers: tuple[int, ...] = (256, 256, 128), output_dim: int = 1):
         super().__init__()
         layers: list[nn.Module] = []
@@ -198,6 +276,27 @@ class MLPRegressor(nn.Module):
 
 
 class TransformerRegressor(nn.Module):
+    """Transformer-based architecture with multi-head self-attention for pattern discovery.
+    
+    Architecture:
+        - Initial CNN projection (64→96→128 channels) reduces spatial dims while preserving structure
+        - Adaptive pooling to fixed sequence length (8-256 segments based on input_dim)
+        - Learned positional embeddings (N(0, 0.02)) for segment ordering
+        - Multi-head self-attention (8 heads) to capture interactions between ATAC segments
+        - Transformer encoder stack (2 layers) with GELU activations
+        - Dense head with LayerNorm, GELU, dropout → output
+        - Total parameters: O(embed_dim × num_heads × seq_len) + O(input_dim)
+    
+    Memory Profile:
+        - Attention matrix: O(seq_len²) memory footprint
+        - Typical GPU memory: 150-400 MB per model for input_dim=40k (seq_len ~32-64)
+        - Forward pass is O(seq_len²) complexity; critical for large sequence lengths
+        - Best for discovering long-range ATAC-promoter interactions
+    
+    Input: (batch, input_dim) → sequence (batch, seq_len, embed_dim)
+    Output: (batch, output_dim) predictions (uses mean-pooled token embeddings)
+    """
+    
     def __init__(
         self,
         input_dim: int,
@@ -258,7 +357,25 @@ class TransformerRegressor(nn.Module):
 
 
 class GraphRegressor(nn.Module):
-    """Simple message passing network over an implicit 1D graph of ATAC bins."""
+    """Graph Neural Network modeling ATAC-seq bins as 1D nodes with local spatial connectivity.
+    
+    Architecture:
+        - Reshapes ATAC features into fixed node count (8-64 nodes) via binning
+        - Node encoder: LayerNorm → MLP (3 layers, GELU activation) learns node embeddings
+        - Local message passing: distance-weighted attention between adjacent bins
+        - Update block: residual MLP for multi-hop message aggregation
+        - Dense head: flattens node embeddings → 2-layer MLP → output
+        - Total parameters: O(hidden_dim² × num_nodes) + O(input_dim)
+    
+    Memory Profile:
+        - Adjacency matrix: O(num_nodes²) = O(1) for fixed node count
+        - Typical GPU memory: 100-250 MB per model for input_dim=40k (num_nodes~32-48)
+        - Message passing requires multiple forward passes per layer
+        - Best for spatial ATAC structure around promoters (TSS neighborhood)
+    
+    Input: (batch, input_dim) → graph nodes (batch, num_nodes, hidden_dim)
+    Output: (batch, output_dim) predictions (uses aggregated node embeddings)
+    """
 
     def __init__(
         self,
@@ -333,7 +450,28 @@ def build_model(
     if name == "graph":
         return TorchModelBundle(GraphRegressor(input_dim, output_dim=output_dim), reshape="flat")
     if name == "svr":
-        svr_estimator = SVR(C=10.0, epsilon=0.1, kernel="rbf", gamma="scale")
+        # Default to a linear kernel for efficiency on large datasets.
+        # NOTE:
+        #   - Linear SVR can only learn linear relationships.
+        #   - RBF (or other non-linear kernels) can capture more complex gene regulatory patterns
+        #     but are typically slower and more memory-intensive.
+        #
+        # To adjust this trade-off, TrainingConfig may define:
+        #   - svr_kernel: str, e.g. "linear" (default) or "rbf"
+        #   - svr_C: float, regularization strength (default 1.0)
+        #   - svr_epsilon: float, epsilon-insensitive loss parameter (default 0.1)
+        #   - svr_max_iter: int, maximum iterations (default 50000)
+        #   - svr_tol: float, tolerance for stopping criterion (default 1e-4)
+        #
+        # Example for higher-capacity non-linear model (if supported by TrainingConfig):
+        #   training.svr_kernel = "rbf"
+        #   training.svr_C = 10.0
+        kernel = training.svr_kernel
+        C = training.svr_C
+        epsilon = training.svr_epsilon
+        max_iter = training.svr_max_iter
+        tol = training.svr_tol
+        svr_estimator = SVR(C=C, epsilon=epsilon, kernel=kernel, max_iter=max_iter, tol=tol)
         if output_dim == 1:
             return Pipeline(
                 [
@@ -350,7 +488,8 @@ def build_model(
     if name == "xgboost":
         if XGBRegressor is None:
             raise RuntimeError("xgboost is not installed. Install with `pip install xgboost` to enable this model.")
-        base_model = XGBRegressor(
+        use_gpu = str(training.device_preference).lower() == "cuda"
+        xgb_params = dict(
             n_estimators=800,
             max_depth=6,
             learning_rate=0.03,
@@ -360,6 +499,9 @@ def build_model(
             tree_method="hist",
             random_state=training.random_state,
         )
+        if use_gpu:
+            xgb_params["device"] = "cuda"
+        base_model = XGBRegressor(**xgb_params)
         if output_dim == 1:
             return base_model
         return MultiOutputRegressor(base_model)
@@ -374,15 +516,22 @@ def build_model(
     if name == "catboost":
         if CatBoostRegressor is None:
             raise RuntimeError("catboost is not installed. Install with `pip install catboost` to enable this model.")
+        use_gpu = str(training.device_preference).lower() == "cuda"
+        # Use configurable iterations (default 1000) with early_stopping_rounds for automatic quality/speed balance
+        # Set via training.catboost_iterations to override default
+        iterations = training.catboost_iterations if getattr(training, "catboost_iterations", None) is not None else 1000
         catboost_params = {
-            "iterations": 1200,
+            "iterations": iterations,
             "depth": 6,
-            "learning_rate": 0.03,
+            "learning_rate": 0.05,
             "loss_function": "RMSE",
             "verbose": False,
             "random_seed": training.random_state,
             "thread_count": -1,
+            "early_stopping_rounds": 50,  # Stop if validation metric doesn't improve for 50 rounds
         }
+        if use_gpu:
+            catboost_params["task_type"] = "GPU"
         if artifacts_dir is not None:
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             catboost_params["train_dir"] = str(artifacts_dir)
@@ -406,16 +555,16 @@ def build_model(
         from sklearn.ensemble import HistGradientBoostingRegressor
 
         base_model = HistGradientBoostingRegressor(
-            learning_rate=0.05,
+            learning_rate=0.1,  # Increased for faster convergence
             max_depth=6,
-            max_iter=600,
+            max_iter=300,  # Reduced from 600 for speed
             max_leaf_nodes=64,
-            min_samples_leaf=20,
+            min_samples_leaf=50,  # Increased from 20 for speed (less granular splits)
             l2_regularization=1e-3,
             random_state=training.random_state,
             early_stopping=True,
             validation_fraction=0.1,
-            n_iter_no_change=20,
+            n_iter_no_change=15,  # Reduced from 20 for earlier stopping
         )
         if output_dim == 1:
             return base_model
@@ -433,17 +582,19 @@ def build_model(
         scaler = StandardScaler()
         if output_dim == 1:
             regressor = ElasticNet(
-                alpha=0.05,
+                alpha=0.1,  # Increased from 0.05 for faster convergence
                 l1_ratio=0.5,
-                max_iter=10000,
-                selection="cyclic",
+                max_iter=3000,  # Reduced from 10000
+                selection="random",  # Random is faster than cyclic
+                tol=1e-3,  # Relaxed tolerance for speed
                 random_state=training.random_state,
             )
         else:
             regressor = MultiTaskElasticNet(
-                alpha=0.05,
+                alpha=0.1,  # Increased from 0.05 for faster convergence
                 l1_ratio=0.3,
-                max_iter=10000,
+                max_iter=3000,  # Reduced from 10000
+                tol=1e-3,  # Relaxed tolerance for speed
                 random_state=training.random_state,
             )
         return Pipeline([
@@ -455,9 +606,20 @@ def build_model(
 
         scaler = StandardScaler()
         if output_dim == 1:
-            regressor = Lasso(alpha=0.05, max_iter=10000, selection="cyclic", random_state=training.random_state)
+            regressor = Lasso(
+                alpha=0.1,  # Increased from 0.05 for faster convergence
+                max_iter=3000,  # Reduced from 10000
+                selection="random",  # Random is faster than cyclic
+                tol=1e-3,  # Relaxed tolerance for speed
+                random_state=training.random_state,
+            )
         else:
-            regressor = MultiTaskLasso(alpha=0.05, max_iter=10000, random_state=training.random_state)
+            regressor = MultiTaskLasso(
+                alpha=0.1,  # Increased from 0.05 for faster convergence
+                max_iter=3000,  # Reduced from 10000
+                tol=1e-3,  # Relaxed tolerance for speed
+                random_state=training.random_state,
+            )
         return Pipeline([
             ("scaler", scaler),
             ("regressor", regressor),

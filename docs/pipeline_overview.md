@@ -39,7 +39,7 @@ To reduce sparsity while maintaining dataset size, each cell is smoothed by aver
 - Neural models: `cnn`, `rnn`, `lstm`, `transformer`, `graph`, `mlp` (PyTorch).
 - Tree ensembles & boosting: `random_forest`, `extra_trees`, `hist_gradient_boosting`, `xgboost`, `catboost`.
 - Linear baselines: `ridge`, `elastic_net`, `lasso`, `ols`.
-- Kernel methods: `svr`.
+- Kernel methods: `svr` (defaults to linear kernel; tune via `TrainingConfig.svr_*`).
 
 Multi-output training (predicting all genes simultaneously) is the default; use `--per-gene` if you want to iterate one gene at a time.
 
@@ -98,5 +98,15 @@ Logs for each CLI run live in `output/logs/<run_name>.log`; Slurm jobs write to 
 - Torch-based multi-output runs (e.g., MLP/transformer) now emit: `feature_importances_mean.csv` (mean/std/median per feature plus TSS-relative metadata), `feature_importances_raw.npz` (compressed stack for reproducibility), `feature_importance_per_gene_summary.csv` (per-gene statistics and correlations vs. TSS distance), `feature_importance_mean.png`, and `feature_importance_vs_tss_distance.png` inside `models/<model>/`.
 - These outputs enable downstream correlation studies without re-running attribution; every feature row includes `gene_name`, `relative_start_bp`, and `distance_to_tss_kb` so plots can be regenerated directly from CSV.
 - Use `scripts/plot_feature_importance_vs_tss.py <run_dir> --model mlp --output analysis/figs/fi_mlp.png` to assemble a publication-ready panel (top features, importance vs. TSS scatter, per-gene correlation boxplot). The script gracefully skips panels if metadata is missing.
+
+## 11. Utilities and environment notes
+
+- `scripts/preflight_check.py` checks environment, required packages, data paths (AnnData/GTF), and SLURM scripts before launching jobs.
+- `scripts/preprocess_endothelial.py` converts endothelial RDS inputs to AnnData with QC matching the embryonic workflow.
+- Optional dependency bundles:
+  - Dev: `requirements-dev.txt` (ruff, black, pytest)
+  - Notebook: `requirements-notebook.txt` (JupyterLab, ipykernel)
+
+SVR hyperparameters (`svr_kernel`, `svr_C`, `svr_epsilon`, `svr_max_iter`, `svr_tol`) are part of `TrainingConfig` with defaults shown in config_reference.
 
 With these steps the repository is ready for publication: preprocessing is documented, all models are accessible via CLI and Slurm, and downstream analysis is consolidated in a single notebook.

@@ -83,6 +83,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Interval (in seconds) between resource usage samples (default 60)",
     )
     parser.add_argument(
+        "--disable-feature-importance",
+        action="store_true",
+        help="Disable feature importance even if enabled by default in config",
+    )
+    parser.add_argument(
+        "--feature-importance-samples",
+        type=int,
+        help="Max samples for feature importance; omit for ALL samples (default: all)",
+    )
+    parser.add_argument(
+        "--feature-importance-batch-size",
+        type=int,
+        help="Batch size for feature-importance gradient accumulation (default 128)",
+    )
+    parser.add_argument(
         "--atac-layer",
         choices=["counts_per_million", "tfidf", "log1p_cpm", "none"],
         help="ATAC normalization layer (default tfidf)",
@@ -194,6 +209,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         if args.atac_layer:
             training.atac_layer = None if args.atac_layer == "none" else args.atac_layer
         training.device_preference = args.device
+        if args.disable_feature_importance:
+            training.enable_feature_importance = False
+        if args.feature_importance_samples is not None:
+            training.feature_importance_samples = args.feature_importance_samples
+        if args.feature_importance_batch_size is not None:
+            training.feature_importance_batch_size = args.feature_importance_batch_size
         if args.rf_n_estimators is not None:
             training.rf_n_estimators = args.rf_n_estimators
         if args.rf_max_depth is not None:

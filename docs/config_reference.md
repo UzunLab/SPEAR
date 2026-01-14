@@ -80,6 +80,11 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 | `rf_min_samples_leaf`       | `None`                         | Model default when unset.                                                  |
 | `rf_max_features`           | `None`                         | Model default when unset.                                                  |
 | `rf_bootstrap`              | `None`                         | Model default when unset.                                                  |
+| `svr_kernel`                | `linear`                       | SVR kernel (`linear`, `rbf`, etc.).                                        |
+| `svr_C`                     | `1.0`                          | SVR regularization strength.                                               |
+| `svr_epsilon`               | `0.1`                          | Epsilon-insensitive loss parameter.                                        |
+| `svr_max_iter`              | `50000`                        | Maximum SVR iterations.                                                    |
+| `svr_tol`                   | `1e-4`                         | SVR solver tolerance.                                                      |
 | `track_history`             | `True`                         | Record training curves.                                                    |
 | `history_metrics`           | `['mse','pearson','spearman']` | Metrics tracked per epoch.                                                 |
 | `group_key`                 | `'sample'`                     | obs column used to group splits and CV folds.                              |
@@ -90,14 +95,14 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 
 `PathsConfig.from_base(base_dir)` resolves the following locations relative to the base directory:
 
-| Path Attribute | Default Location                              |
-| -------------- | --------------------------------------------- |
+| Path Attribute | Default Location                                 |
+| -------------- | ------------------------------------------------ |
 | `atac_path`    | `data/embryonic/processed/combined_ATAC_qc.h5ad` |
 | `rna_path`     | `data/embryonic/processed/combined_RNA_qc.h5ad`  |
-| `gtf_path`     | `data/reference/GCF_000001635.27_genomic.gtf` |
-| `output_dir`   | `output/results`                              |
-| `logs_dir`     | `output/logs`                                 |
-| `figures_dir`  | `analysis/figs`                               |
+| `gtf_path`     | `data/reference/GCF_000001635.27_genomic.gtf`    |
+| `output_dir`   | `output/results`                                 |
+| `logs_dir`     | `output/logs`                                    |
+| `figures_dir`  | `analysis/figs`                                  |
 
 Override paths via CLI flags (`--atac-path`, `--rna-path`, `--gtf-path`) or by supplying a custom JSON config to the pipeline.
 
@@ -118,18 +123,18 @@ Torch optimizers use `Adam(lr=1e-3, weight_decay=1e-5)` with automatic mixed pre
 
 ### Scikit-learn / XGBoost Models
 
-| Model                    | Default Hyperparameters                                                                                                                   |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `svr`                    | `C=10.0`, `epsilon=0.1`, `kernel='rbf'`, `gamma='scale'`, multi-output uses `MultiOutputRegressor`.                                       |
-| `xgboost`                | `n_estimators=800`, `max_depth=6`, `learning_rate=0.03`, `subsample=0.7`, `colsample_bytree=0.9`, `reg_lambda=1.0`, `tree_method='hist'`. |
-| `catboost`               | `iterations=1200`, `depth=6`, `learning_rate=0.03`, `loss_function='RMSE'`, auto CPU/GPU detection, verbose disabled.                     |
-| `random_forest`          | `n_estimators=600`, `min_samples_leaf=2`, `max_features=None`, `bootstrap=True`, `oob_score=True`.                                        |
-| `extra_trees`            | `n_estimators=800`, unlimited depth, `min_samples_leaf=1`, `bootstrap=False`.                                                             |
-| `hist_gradient_boosting` | `learning_rate=0.05`, `max_depth=6`, `max_iter=600`, `max_leaf_nodes=64`, `min_samples_leaf=20`, `l2_regularization=1e-3`.                |
-| `ridge`                  | `alpha=1.0`, with `StandardScaler`.                                                                                                       |
-| `elastic_net`            | Single-target: `alpha=0.05`, `l1_ratio=0.5`; multi-target: `alpha=0.05`, `l1_ratio=0.3`, both with `StandardScaler`.                      |
-| `lasso`                  | Single-target: `alpha=0.05`; multi-target: `alpha=0.05` via `MultiTaskLasso`; both include `StandardScaler`.                              |
-| `ols`                    | Ordinary least squares (`LinearRegression`) preceded by `StandardScaler`.                                                                 |
+| Model                    | Default Hyperparameters                                                                                                                                      |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `svr`                    | `kernel='linear'`, `C=1.0`, `epsilon=0.1`, `max_iter=50_000`, `tol=1e-4`; multi-output uses `MultiOutputRegressor`. Configurable via `TrainingConfig.svr_*`. |
+| `xgboost`                | `n_estimators=800`, `max_depth=6`, `learning_rate=0.03`, `subsample=0.7`, `colsample_bytree=0.9`, `reg_lambda=1.0`, `tree_method='hist'`.                    |
+| `catboost`               | `iterations=1200`, `depth=6`, `learning_rate=0.03`, `loss_function='RMSE'`, auto CPU/GPU detection, verbose disabled.                                        |
+| `random_forest`          | `n_estimators=600`, `min_samples_leaf=2`, `max_features=None`, `bootstrap=True`, `oob_score=True`.                                                           |
+| `extra_trees`            | `n_estimators=800`, unlimited depth, `min_samples_leaf=1`, `bootstrap=False`.                                                                                |
+| `hist_gradient_boosting` | `learning_rate=0.05`, `max_depth=6`, `max_iter=600`, `max_leaf_nodes=64`, `min_samples_leaf=20`, `l2_regularization=1e-3`.                                   |
+| `ridge`                  | `alpha=1.0`, with `StandardScaler`.                                                                                                                          |
+| `elastic_net`            | Single-target: `alpha=0.05`, `l1_ratio=0.5`; multi-target: `alpha=0.05`, `l1_ratio=0.3`, both with `StandardScaler`.                                         |
+| `lasso`                  | Single-target: `alpha=0.05`; multi-target: `alpha=0.05` via `MultiTaskLasso`; both include `StandardScaler`.                                                 |
+| `ols`                    | Ordinary least squares (`LinearRegression`) preceded by `StandardScaler`.                                                                                    |
 
 ## Slurm Environment Variables
 

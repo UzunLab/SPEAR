@@ -4,6 +4,7 @@ jobs/
 todo.md
 output/
 results/
+work/
 
 # Python cache and build artefacts
 __pycache__/

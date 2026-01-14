@@ -83,12 +83,23 @@ class TrainingConfig:
     rf_min_samples_leaf: Optional[int] = None
     rf_max_features: float | str | None = None
     rf_bootstrap: Optional[bool] = None
+    svr_kernel: str = "linear"
+    svr_C: float = 1.0
+    svr_epsilon: float = 0.1
+    svr_max_iter: int = 50_000
+    svr_tol: float = 1e-4
     track_history: bool = True
     history_metrics: List[str] = field(default_factory=lambda: ["mse", "pearson", "spearman"])
     group_key: Optional[str] = "sample"
     atac_layer: Optional[str] = "tfidf"
     rna_expression_layer: Optional[str] = "log1p_cpm"
     resource_sample_seconds: float = 60.0
+
+    # Feature importance configuration for torch models in multi-output mode
+    # Enabled by default to always record FI; set samples=None to use all available samples
+    enable_feature_importance: bool = True
+    feature_importance_samples: Optional[int] = None
+    feature_importance_batch_size: int = 128
 
     def validate(self) -> None:
         total = self.train_fraction + self.val_fraction + self.test_fraction
@@ -116,8 +127,21 @@ class TrainingConfig:
             raise ValueError("rf_min_samples_leaf must be positive when specified")
         if isinstance(self.rf_max_features, float) and not (0.0 < self.rf_max_features <= 1.0):
             raise ValueError("rf_max_features as a float must be within (0, 1]")
+        if self.svr_C <= 0:
+            raise ValueError("svr_C must be positive")
+        if self.svr_epsilon < 0:
+            raise ValueError("svr_epsilon must be non-negative")
+        if self.svr_max_iter <= 0:
+            raise ValueError("svr_max_iter must be positive")
+        if self.svr_tol <= 0:
+            raise ValueError("svr_tol must be positive")
         if self.k_folds > 1 and self.group_key is not None and not self.group_key:
             raise ValueError("group_key must be a non-empty string when provided")
+        if self.enable_feature_importance:
+            if self.feature_importance_samples is not None and self.feature_importance_samples <= 0:
+                raise ValueError("feature_importance_samples must be positive when specified")
+            if self.feature_importance_batch_size <= 0:
+                raise ValueError("feature_importance_batch_size must be positive")
         if self.resource_sample_seconds <= 0:
             raise ValueError("resource_sample_seconds must be positive")
 
