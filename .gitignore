@@ -5,6 +5,8 @@ todo.md
 output/
 results/
 work/
+archive/
+analysis/param_count.csv
 
 # Python cache and build artefacts
 __pycache__/

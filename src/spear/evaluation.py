@@ -327,6 +327,59 @@ def _export_feature_importance_artifacts(
         end_ts,
     )
 
+
+def _export_shap_importance_artifacts(
+    output_dir: Path,
+    model_name: str,
+    shap_importances: np.ndarray,
+    feature_names: Sequence[str],
+    *,
+    method: Optional[str] = None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shap_values = np.asarray(shap_importances, dtype=np.float64)
+    if shap_values.size == 0 or shap_values.ndim != 1:
+        _LOG.info("SHAP export skipped | model=%s | reason=no values", model_name)
+        return
+
+    plot_feature_importance(
+        shap_values,
+        feature_names,
+        output_dir / "shap_importance_mean.png",
+        f"SHAP mean | {model_name.upper()}",
+        top_n=30,
+    )
+
+    # Parse feature metadata (same as feature importance export)
+    metadata_records = [_feature_name_metadata(name) for name in feature_names]
+    metadata_df = pd.DataFrame(metadata_records) if metadata_records else None
+
+    shap_df = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "shap_mean_abs": shap_values,
+        }
+    )
+
+    # Add metadata columns (TSS distance, gene name, etc.) if available
+    if metadata_df is not None and not metadata_df.empty:
+        shap_df = pd.concat([shap_df, metadata_df], axis=1)
+    shap_path = output_dir / "shap_importances_mean.csv"
+    shap_df.to_csv(shap_path, index=False)
+    _LOG.info("Saved SHAP mean importances (%d rows) to %s", shap_df.shape[0], shap_path)
+
+    summary = {
+        "model": model_name,
+        "method": method,
+        "num_features": int(shap_values.size),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "csv_path": str(shap_path),
+        "plot_path": str(output_dir / "shap_importance_mean.png"),
+    }
+    summary_path = output_dir / "shap_importance_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
+    _LOG.info("Wrote SHAP summary manifest to %s", summary_path)
+
 try:
     import torch.nn as _torch_nn
 except ImportError:  # pragma: no cover - torch optional during some tests
@@ -920,8 +973,14 @@ def _run_cellwise_pipeline(
                 model_export_meta[model_name]["failures"].append(str(exc))
             else:
                 model_dir = _ensure_directory(model_dir)
-                preds_df = _cellwise_predictions_dataframe(result)
-                preds_df.to_csv(model_dir / "predictions_raw.csv", index=False)
+                if not config.training.export_raw_predictions:
+                    _LOG.info(
+                        "Skipping raw predictions export | model=%s | reason=export_raw_predictions=False",
+                        model_name,
+                    )
+                else:
+                    preds_df = _cellwise_predictions_dataframe(result)
+                    preds_df.to_csv(model_dir / "predictions_raw.csv", index=False)
 
                 _write_cellwise_metrics(model_dir, result)
                 _plot_cellwise_diagnostics(model_dir, result)
@@ -938,7 +997,7 @@ def _run_cellwise_pipeline(
                             title=f"{model_name.upper()} | {metric.title()}",
                         )
 
-                if getattr(result, "feature_importances", None) is not None and getattr(result, "feature_names", None):
+                if getattr(result, "feature_importances", None) is not None and getattr(result, "feature_names", None) is not None:
                     _export_feature_importance_artifacts(
                         model_dir,
                         model_name,
@@ -947,6 +1006,14 @@ def _run_cellwise_pipeline(
                         method=getattr(result, "feature_importance_method", None),
                         gene_names=result.gene_names,
                         feature_block_slices=getattr(result, "feature_block_slices", None),
+                    )
+                if getattr(result, "shap_importances_mean", None) is not None and getattr(result, "feature_names", None) is not None:
+                    _export_shap_importance_artifacts(
+                        model_dir,
+                        model_name,
+                        np.asarray(result.shap_importances_mean, dtype=np.float64),
+                        list(result.feature_names),
+                        method=getattr(result, "shap_importance_method", None),
                     )
 
                 metric_payload = {"model": model_name, "num_genes": dataset.num_genes()}
@@ -959,9 +1026,10 @@ def _run_cellwise_pipeline(
 
                 # Verify all critical files were written before logging completion
                 critical_files = [
-                    model_dir / "predictions_raw.csv",
                     model_dir / "metrics_aggregate.csv",
                 ]
+                if config.training.export_raw_predictions:
+                    critical_files.append(model_dir / "predictions_raw.csv")
                 all_files_exist = all(f.exists() for f in critical_files)
                 if all_files_exist:
                     _LOG.info(

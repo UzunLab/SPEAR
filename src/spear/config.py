@@ -101,6 +101,10 @@ class TrainingConfig:
     enable_feature_importance: bool = True
     feature_importance_samples: Optional[int] = None
     feature_importance_batch_size: int = 128
+    enable_shap: bool = True
+    shap_max_samples: Optional[int] = 500
+    shap_background_samples: int = 100
+    export_raw_predictions: bool = True
 
     def validate(self) -> None:
         total = self.train_fraction + self.val_fraction + self.test_fraction
@@ -143,6 +147,11 @@ class TrainingConfig:
                 raise ValueError("feature_importance_samples must be positive when specified")
             if self.feature_importance_batch_size <= 0:
                 raise ValueError("feature_importance_batch_size must be positive")
+        if self.enable_shap:
+            if self.shap_max_samples is not None and self.shap_max_samples <= 0:
+                raise ValueError("shap_max_samples must be positive when specified")
+            if self.shap_background_samples <= 0:
+                raise ValueError("shap_background_samples must be positive")
         if self.resource_sample_seconds <= 0:
             raise ValueError("resource_sample_seconds must be positive")
 
