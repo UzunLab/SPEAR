@@ -368,6 +368,147 @@ def _export_shap_importance_artifacts(
     shap_df.to_csv(shap_path, index=False)
     _LOG.info("Saved SHAP mean importances (%d rows) to %s", shap_df.shape[0], shap_path)
 
+    def _extract_distance_kb(table: pd.DataFrame) -> tuple[Optional[pd.Series], Optional[str], bool]:
+        preferred_cols = [
+            "signed_distance_to_tss_kb",
+            "delta_to_tss_kb",
+            "distance_to_tss_kb",
+        ]
+        for col in preferred_cols:
+            if col in table.columns:
+                return pd.to_numeric(table[col], errors="coerce"), col, True
+
+        abs_cols = ["distance_to_tss_abs_kb"]
+        for col in abs_cols:
+            if col in table.columns:
+                return pd.to_numeric(table[col], errors="coerce"), col, False
+
+        bp_cols = ["delta_to_tss_bp", "distance_to_tss_bp", "relative_center_bp"]
+        for col in bp_cols:
+            if col in table.columns:
+                return pd.to_numeric(table[col], errors="coerce") / 1_000.0, col, True
+
+        return None, None, False
+
+    def _plot_shap_vs_tss_distance(
+        table: pd.DataFrame,
+        distance_kb: pd.Series,
+        output_path: Path,
+        title: str,
+        *,
+        max_distance_kb: float,
+        show_scatter: bool = False,
+        y_limits: Optional[tuple[float, float]] = None,
+    ) -> bool:
+        plot_df = pd.DataFrame(
+            {
+                "distance_kb": distance_kb,
+                "shap_value": pd.to_numeric(table["shap_mean_abs"], errors="coerce"),
+            }
+        )
+        plot_df = plot_df.replace([np.inf, -np.inf], np.nan).dropna()
+        if plot_df.empty:
+            return False
+        plot_df = plot_df[plot_df["distance_kb"].abs() <= max_distance_kb].copy()
+        if plot_df.empty:
+            return False
+        plot_df.sort_values("distance_kb", inplace=True)
+
+        per_bin = (
+            plot_df.groupby("distance_kb", sort=True)["shap_value"]
+            .quantile(0.9)
+            .reset_index()
+        )
+        if per_bin.empty:
+            return False
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig, ax = plt.subplots(figsize=(7.5, 4.8))
+        if show_scatter:
+            sns.scatterplot(
+                data=plot_df,
+                x="distance_kb",
+                y="shap_value",
+                s=30,
+                alpha=0.45,
+                edgecolor="none",
+                color="#4daf4a",
+                ax=ax,
+            )
+        ax.plot(
+            per_bin["distance_kb"],
+            per_bin["shap_value"],
+            color="#e41a1c",
+            linewidth=1.5,
+            label="90th percentile",
+        )
+        ax.legend(loc="upper right", frameon=True)
+        ax.axvline(0.0, color="#999999", linestyle="--", linewidth=1)
+        ax.set_xlim(-max_distance_kb, max_distance_kb)
+        if y_limits is not None:
+            ax.set_ylim(y_limits)
+        ax.set_xlabel("Distance to TSS (kb)")
+        ax.set_ylabel("Mean |SHAP|")
+        ax.set_title(title)
+        sns.despine(fig, left=True, bottom=True)
+        plt.tight_layout()
+        fig.savefig(output_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        return True
+
+    distance_kb, distance_col, distance_signed = _extract_distance_kb(shap_df)
+    distance_plot_path = output_dir / "shap_vs_tss.png"
+    distance_plot_zoomed_path = output_dir / "shap_vs_tss_zoomed.png"
+    if distance_kb is not None and distance_col is not None:
+        if not distance_signed:
+            _LOG.info(
+                "SHAP distance plot uses unsigned distances (%s); check feature metadata",
+                distance_col,
+            )
+        created = _plot_shap_vs_tss_distance(
+            shap_df,
+            distance_kb,
+            distance_plot_path,
+            f"SHAP vs TSS distance | {model_name.upper()}",
+            max_distance_kb=10.0,
+            show_scatter=True,
+        )
+        if created:
+            _LOG.info("Saved SHAP vs TSS plot to %s", distance_plot_path)
+        else:
+            distance_plot_path = None
+        zoom_df = pd.DataFrame(
+            {
+                "distance_kb": distance_kb,
+                "shap_value": pd.to_numeric(shap_df["shap_mean_abs"], errors="coerce"),
+            }
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+        zoom_df = zoom_df[zoom_df["distance_kb"].abs() <= 5.0]
+        if zoom_df.empty:
+            zoom_y_limits = None
+        else:
+            zoom_max = (
+                zoom_df.groupby("distance_kb", sort=True)["shap_value"]
+                .quantile(0.9)
+                .max()
+            )
+            zoom_y_limits = (0.0, float(zoom_max) * 1.15) if pd.notna(zoom_max) else None
+        zoomed = _plot_shap_vs_tss_distance(
+            shap_df,
+            distance_kb,
+            distance_plot_zoomed_path,
+            f"SHAP vs TSS distance (zoomed) | {model_name.upper()}",
+            max_distance_kb=5.0,
+            y_limits=zoom_y_limits,
+        )
+        if zoomed:
+            _LOG.info("Saved zoomed SHAP vs TSS plot to %s", distance_plot_zoomed_path)
+        else:
+            distance_plot_zoomed_path = None
+    else:
+        distance_plot_path = None
+        distance_plot_zoomed_path = None
+
     summary = {
         "model": model_name,
         "method": method,
@@ -376,6 +517,10 @@ def _export_shap_importance_artifacts(
         "csv_path": str(shap_path),
         "plot_path": str(output_dir / "shap_importance_mean.png"),
     }
+    if distance_plot_path is not None:
+        summary["distance_plot_path"] = str(distance_plot_path)
+    if distance_plot_zoomed_path is not None:
+        summary["distance_plot_zoomed_path"] = str(distance_plot_zoomed_path)
     summary_path = output_dir / "shap_importance_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
     _LOG.info("Wrote SHAP summary manifest to %s", summary_path)

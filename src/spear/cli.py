@@ -110,11 +110,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(export_raw_predictions=True)
     parser.add_argument(
-        "--skip-raw-predictions-export",
-        action="store_true",
-        help="Deprecated; use --no-export-raw-predictions",
-    )
-    parser.add_argument(
         "--shap-max-samples",
         type=int,
         help="Max samples to evaluate SHAP on (default 500)",
@@ -245,8 +240,6 @@ def main(argv: Optional[list[str]] = None) -> None:
         if args.disable_shap:
             training.enable_shap = False
         training.export_raw_predictions = args.export_raw_predictions
-        if args.skip_raw_predictions_export:
-            training.export_raw_predictions = False
         if args.shap_max_samples is not None:
             training.shap_max_samples = args.shap_max_samples
         if args.shap_background_samples is not None:
@@ -326,9 +319,6 @@ def _config_from_json(payload: dict) -> PipelineConfig:
     base_dir = payload.get("base_dir", str(Path.cwd()))
     paths = PathsConfig.from_base(base_dir)
     training_payload = payload.get("training", {})
-    if "skip_raw_predictions_export" in training_payload and "export_raw_predictions" not in training_payload:
-        training_payload = dict(training_payload)
-        training_payload["export_raw_predictions"] = not training_payload.pop("skip_raw_predictions_export")
     models_payload = payload.get("models", {})
 
     training = TrainingConfig(**training_payload)

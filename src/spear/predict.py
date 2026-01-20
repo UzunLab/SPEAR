@@ -38,9 +38,6 @@ def _load_run_context(run_dir: Path) -> tuple[TrainingConfig, Path]:
     cfg_path = run_dir / "run_configuration.json"
     payload = json.loads(cfg_path.read_text())
     training_payload = payload["pipeline_config"]["training"]
-    if "skip_raw_predictions_export" in training_payload and "export_raw_predictions" not in training_payload:
-        training_payload = dict(training_payload)
-        training_payload["export_raw_predictions"] = not training_payload.pop("skip_raw_predictions_export")
     training = TrainingConfig(**training_payload)
     gtf_path_str = payload["pipeline_config"]["paths"]["gtf_path"]
     gtf_path = Path(gtf_path_str).expanduser()

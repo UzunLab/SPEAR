@@ -19,3 +19,20 @@ The raw and processed data files are available from GEO accession [GSE270141](ht
 - **ATAC fragments**: Per-sample fragment files for chromatin accessibility
 
 Store downloaded files under `data/endothelial/raw/`.
+
+## Dataset Summary (this study)
+
+| Field                    | Value                                                                                         |
+| ------------------------ | --------------------------------------------------------------------------------------------- |
+| Conditions used          | normoxia only                                                                                 |
+| Cells (raw)              | 5,621                                                                                         |
+| Cells (post-QC)          | 4,735                                                                                         |
+| Peaks (post-QC)          | 396,920                                                                                       |
+| QC applied in this study | Barcode intersection; RNA mito <15%; min genes/cells: 200/3 for RNA + ATAC; re-align after QC |
+| Genes modeled            | Configurable; 1000 (100 genes fallback)                                                       |
+| Annotation               | GENCODE v44                                                                                   |
+
+## Processed Snapshot (this repo)
+
+- RNA: `data/endothelial/processed/combined_RNA_qc_<15%mito.h5ad` (cells=4735, genes=17351)
+- ATAC: `data/endothelial/processed/combined_ATAC_qc_<15%mito.h5ad` (cells=4735, peaks=396920)

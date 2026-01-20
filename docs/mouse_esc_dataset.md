@@ -36,6 +36,25 @@ The GEO series reports 11 samples spanning E7.5 to E8.75, including wild-type re
 - **Library sizes:** ATAC median 25k peaks/cell (IQR 14k–39k); RNA median 11k UMIs/cell (IQR 7k–17k).
 - **Metadata:** Peak identifiers encode genomic coordinates; GTF parsing ensures gene IDs (e.g., `Kmt5b`) resolve consistently across modalities.
 
+## Dataset Summary (this study)
+
+| Field | Value |
+| --- | --- |
+| Conditions used | WT timepoints only (CRISPR_T not used) |
+| Cells (raw) | 54,301 |
+| Cells (post-QC) | 54,301 |
+| Peaks (post-QC) | 192,248 |
+| QC applied in this study | Barcode intersection; RNA mito <5%; min genes/cells: 200/3 for RNA + ATAC |
+| Genes modeled | Configurable; 1000 (100 genes fallback) |
+| Annotation | NCBI RefSeq (GCF_000001635.27) |
+
+## Processed Snapshot (example)
+
+These counts are from a local processed run and are **not** shipped with the repo; they are provided here as a reference target after QC:
+
+- RNA: `data/embryonic/processed/combined_RNA_qc.h5ad` (cells=54301, genes=32285)
+- ATAC: `data/embryonic/processed/combined_ATAC_qc.h5ad` (cells=54301, peaks=192248)
+
 ## CRISPR KO Replicates
 
 - Do **not** merge CRISPR knockout replicates when preparing AnnData inputs. Each replicate should remain a distinct sample in `obs` (e.g., `obs["replicate"]`) so biological variance is preserved.
