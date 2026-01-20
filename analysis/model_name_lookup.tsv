@@ -1,0 +1,17 @@
+model_id	model_display_name	model_short_name
+cnn	Convolutional Neural Network	CNN
+rnn	Recurrent Neural Network	RNN
+lstm	Long Short-Term Memory Network	LSTM
+transformer	Transformer Encoder	Transformer
+graph	Graph Neural Network	GNN
+mlp	Multilayer Perceptron	MLP
+random_forest	Random Forest	RF
+extra_trees	Extra Trees (Random Forest Variant)	Extra Trees
+hist_gradient_boosting	Histogram Gradient Boosting	HistGB
+xgboost	XGBoost	XGBoost
+catboost	CatBoost	CatBoost
+ridge	Ridge Regression	Ridge
+elastic_net	Elastic Net	Elastic Net
+lasso	Lasso Regression	Lasso
+ols	Ordinary Least Squares	OLS
+svr	Support Vector Regressor	SVR
