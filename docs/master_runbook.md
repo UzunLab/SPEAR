@@ -1,4 +1,4 @@
-# SPEAR End-to-End Runbook (Single-cell Prediction of gene Expression from ATAC-seq Regression)
+# SPEAR End-to-End Runbook (Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts)
 
 This runbook connects the biological motivation for the mouse embryonic stem cell (mESC) project with the computational workflow implemented in the SPEAR repository. Follow the stages in order when onboarding a new environment, reproducing results, or preparing a public release.
 

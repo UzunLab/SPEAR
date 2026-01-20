@@ -1,4 +1,4 @@
-# SPEAR: Single-cell Prediction of gene Expression from ATAC-seq Regression
+# SPEAR: <u>S</u>ingle-cell-based <u>P</u>rediction of Gene <u>E</u>xpression from Chromatin <u>A</u>ccessibility <u>R</u>eadouts
 
 <div align="center">
   <img src="docs/images/spear_logo.png" alt="SPEAR Logo" width="400"/>
@@ -8,7 +8,7 @@
 
 ![SPEAR framework figure](docs/images/SPEAR%20Framework%20Figure_transparent%20background.png)
 
-SPEAR (Single-cell Prediction of gene Expression from ATAC-seq Regression) is an end-to-end machine-learning framework for training and evaluating multi-omics integration models. The toolkit focuses on predicting the full RNA gene expression vector for every cell directly from its paired single-cell ATAC accessibility profile, pairing reproducible preprocessing with a modular model zoo, batchable CLI entry points, and plotting notebooks for downstream analysis.
+SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts) is an end-to-end machine-learning framework for training and evaluating multi-omics integration models. The toolkit focuses on predicting the full RNA gene expression vector for every cell directly from its paired single-cell ATAC accessibility profile, pairing reproducible preprocessing with a modular model zoo, batchable CLI entry points, and plotting notebooks for downstream analysis.
 
 ## Key Features
 

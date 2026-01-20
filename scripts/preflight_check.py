@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pre-flight validation script for SPEAR pipeline runs.
 
-SPEAR: Single-cell Prediction of gene Expression from ATAC-seq Regression.
+SPEAR: Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts.
 Validates environment, data files, dependencies, and configuration before launching
 expensive HPC jobs. Run this to catch configuration errors early (SLURM job scripts are optional).
 

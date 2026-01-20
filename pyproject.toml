@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spear"
 version = "0.1.0"
-description = "SPEAR: Single-cell Prediction of gene Expression from ATAC-seq Regression"
+description = "SPEAR: Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts"
 readme = "README.md"
 authors = [{name = "tqw5435"}]
 requires-python = ">=3.10"

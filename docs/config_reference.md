@@ -1,6 +1,6 @@
 # SPEAR Configuration Reference
 
-This document outlines every user-facing knob in SPEAR (Single-cell Prediction of gene Expression from ATAC-seq Regression), implemented in the `spear` package, including CLI flags, training defaults, and model hyperparameters.
+This document outlines every user-facing knob in SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts), implemented in the `spear` package, including CLI flags, training defaults, and model hyperparameters.
 
 ## Command Line Interface
 
