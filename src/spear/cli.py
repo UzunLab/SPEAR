@@ -12,7 +12,7 @@ from .logging_utils import configure_logging, get_logger
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="SPEAR: Single-cell Prediction of gene Expression from ATAC-seq Regression")
+    parser = argparse.ArgumentParser(description="SPEAR: Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts")
     parser.add_argument(
         "--base-dir",
         default=str(Path.cwd()),

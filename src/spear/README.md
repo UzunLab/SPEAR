@@ -1,4 +1,4 @@
-# SPEAR Package (Single-cell Prediction of gene Expression from ATAC-seq Regression)
+# SPEAR Package (Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts)
 
 Python package housing the reusable components that power the SPEAR workflow:
 
