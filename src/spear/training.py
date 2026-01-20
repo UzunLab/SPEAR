@@ -111,6 +111,45 @@ def _reshape_tensor_for_model(tens: torch.Tensor, reshape: str | None) -> torch.
         return tens.reshape(tens.shape[0], -1, 1)
     return tens
 
+
+def _should_scale_targets(config: TrainingConfig) -> bool:
+    """
+    Decide whether target values should be scaled based on the training configuration.
+
+    Parameters
+    ----------
+    config : TrainingConfig
+        Training configuration containing options that control target scaling,
+        including the choice of target scaler, whether scaling is forced, and
+        whether logarithmic transforms are already applied to the targets.
+
+    Returns
+    -------
+    bool
+        True if target scaling should be applied, False if it should be skipped.
+
+    Notes
+    -----
+    Target scaling is skipped when:
+
+    * ``config.target_scaler`` is ``None`` or ``"none"``.
+    * A logarithmic transform is already in use via ``config.log1p_transform`` or
+      an RNA expression layer whose name starts with ``"log"``.
+
+    Target scaling is always applied when:
+
+    * ``config.force_target_scaling`` is True, regardless of other settings.
+    """
+    if config.target_scaler in (None, "none"):
+        return False
+    if config.force_target_scaling:
+        return True
+    if config.log1p_transform or (
+        config.rna_expression_layer and config.rna_expression_layer.lower().startswith("log")
+    ):
+        return False
+    return True
+
 _LOG = get_logger(__name__)
 
 
@@ -319,6 +358,8 @@ class CellwiseModelResult:
     feature_importances: Optional[np.ndarray] = None
     feature_names: Optional[List[str]] = None
     feature_importance_method: Optional[str] = None
+    shap_importances_mean: Optional[np.ndarray] = None
+    shap_importance_method: Optional[str] = None
     feature_block_slices: Optional[List[Tuple[int, int]]] = None
     feature_scaler: Optional[StandardScaler | MinMaxScaler] = None
     target_scaler: Optional[StandardScaler | MinMaxScaler] = None
@@ -1053,6 +1094,97 @@ def _compute_torch_feature_importance(
     return None
 
 
+def _compute_torch_shap_importance(
+    bundle: TorchModelBundle,
+    X_reference: np.ndarray,
+    *,
+    device: torch.device,
+    max_samples: Optional[int] = 500,
+    background_samples: int = 100,
+) -> Optional[np.ndarray]:
+    """Estimate mean absolute SHAP values for a torch model (best-effort)."""
+    try:
+        import shap
+    except Exception as exc:  # pragma: no cover - optional dependency
+        _LOG.info("SHAP unavailable; skipping SHAP export (%s).", exc)
+        return None
+
+    X_ref = np.asarray(X_reference, dtype=np.float32)
+    if X_ref.size == 0:
+        return None
+
+    rng = np.random.default_rng(42)
+    sample_limit = max_samples if max_samples is not None and max_samples > 0 else None
+    if sample_limit is not None and X_ref.shape[0] > sample_limit:
+        idx = rng.choice(X_ref.shape[0], size=sample_limit, replace=False)
+        idx.sort()
+        X_ref = X_ref[idx]
+
+    background_size = min(background_samples, X_ref.shape[0])
+    if background_size <= 0:
+        return None
+    background_idx = rng.choice(X_ref.shape[0], size=background_size, replace=False)
+    background = X_ref[background_idx]
+
+    model = bundle.model.to(device)
+    model = _wrap_model_for_multi_gpu(model, device)
+    model.eval()
+
+    class _ShapWrapper(nn.Module):
+        def __init__(self, inner: nn.Module, reshape: Optional[str]) -> None:
+            super().__init__()
+            self.inner = inner
+            self.reshape = reshape
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = _reshape_tensor_for_model(x, self.reshape)
+            out = self.inner(x)
+            if out.ndim == 1:
+                return out.unsqueeze(1)
+            if out.ndim == 2:
+                if out.shape[1] > 1:
+                    return out.mean(dim=1, keepdim=True)
+                return out
+            out = out.reshape(out.shape[0], -1)
+            if out.shape[1] > 1:
+                return out.mean(dim=1, keepdim=True)
+            return out
+
+    wrapper = _ShapWrapper(model, bundle.reshape)
+    background_tensor = torch.tensor(background, device=device, dtype=torch.float32)
+    sample_tensor = torch.tensor(X_ref, device=device, dtype=torch.float32)
+
+    try:
+        explainer = shap.GradientExplainer(wrapper, background_tensor)
+        shap_values = explainer.shap_values(sample_tensor)
+    except Exception as exc:
+        msg = (
+            "Failed to compute SHAP values using GradientExplainer. "
+            "This often indicates that the model output shape is incompatible with SHAP's expectations. "
+            f"SHAP expects the first dimension of the model output to match the input batch size "
+            f"(got input batch size {sample_tensor.shape[0]})."
+        )
+        with contextlib.suppress(Exception):
+            test_out = wrapper(sample_tensor[:1])
+            msg += f" Example model output shape for batch_size=1: {tuple(test_out.shape)}."
+        _LOG.error("%s Original error: %s", msg, exc)
+        return None
+    if isinstance(shap_values, list):
+        shap_arr = np.stack(shap_values, axis=0)
+        if shap_arr.ndim > 3:
+            shap_arr = shap_arr.reshape(shap_arr.shape[0], shap_arr.shape[1], -1)
+        if shap_arr.ndim != 3:
+            return None
+        return np.mean(np.abs(shap_arr), axis=(0, 1))
+
+    shap_arr = np.asarray(shap_values)
+    if shap_arr.ndim > 2:
+        shap_arr = shap_arr.reshape(shap_arr.shape[0], -1)
+    if shap_arr.ndim != 2:
+        return None
+    return np.mean(np.abs(shap_arr), axis=0)
+
+
 def _compute_torch_permutation_importance(
     bundle: TorchModelBundle,
     X_reference: np.ndarray,
@@ -1276,6 +1408,8 @@ def train_multi_output_model(
 
     feature_importances: Optional[np.ndarray] = None
     feature_importance_method: Optional[str] = None
+    shap_importances_mean: Optional[np.ndarray] = None
+    shap_importance_method: Optional[str] = None
     if isinstance(model, TorchModelBundle) and config.enable_feature_importance:
         fi_start = time.perf_counter()
         fi_max_samples = config.feature_importance_samples
@@ -1307,6 +1441,33 @@ def train_multi_output_model(
                 eff_samples,
                 fi_batch_size,
                 fi_elapsed,
+            )
+    if isinstance(model, TorchModelBundle) and config.enable_shap:
+        shap_start = time.perf_counter()
+        try:
+            device = _select_device(config.device_preference)
+            shap_importances_mean = _compute_torch_shap_importance(
+                model,
+                splits.X_val,
+                device=device,
+                max_samples=config.shap_max_samples,
+                background_samples=config.shap_background_samples,
+            )
+            if shap_importances_mean is not None:
+                shap_importance_method = "shap_gradient_explainer_mean_abs"
+        except Exception as exc:  # pragma: no cover - best-effort diagnostics
+            _LOG.warning("Failed to compute SHAP importances for %s: %s", model_name, exc)
+            shap_importances_mean = None
+            shap_importance_method = None
+        finally:
+            shap_elapsed = time.perf_counter() - shap_start
+            _LOG.info(
+                "SHAP completed | model=%s | method=%s | samples=%s | background=%d | %.2fs",
+                model_name,
+                shap_importance_method or "n/a",
+                config.shap_max_samples if config.shap_max_samples is not None else "all",
+                config.shap_background_samples,
+                shap_elapsed,
             )
 
     y_train_true = _ensure_2d(_unscale_targets(prepared.target_scaler, splits.y_train))
@@ -1355,6 +1516,8 @@ def train_multi_output_model(
         feature_importances=feature_importances,
         feature_names=getattr(dataset, "feature_names", None),
         feature_importance_method=feature_importance_method,
+        shap_importances_mean=shap_importances_mean,
+        shap_importance_method=shap_importance_method,
         feature_block_slices=getattr(dataset, "feature_block_slices", None),
         feature_scaler=prepared.feature_scaler,
         target_scaler=prepared.target_scaler,

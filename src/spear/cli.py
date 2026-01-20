@@ -98,6 +98,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Batch size for feature-importance gradient accumulation (default 128)",
     )
     parser.add_argument(
+        "--disable-shap",
+        action="store_true",
+        help="Disable SHAP attribution export for multi-output torch models",
+    )
+    parser.add_argument(
+        "--no-export-raw-predictions",
+        dest="export_raw_predictions",
+        action="store_false",
+        help="Disable exporting per-cell predictions_raw.csv to reduce runtime and output size",
+    )
+    parser.set_defaults(export_raw_predictions=True)
+    parser.add_argument(
+        "--shap-max-samples",
+        type=int,
+        help="Max samples to evaluate SHAP on (default 500)",
+    )
+    parser.add_argument(
+        "--shap-background-samples",
+        type=int,
+        help="Background samples used for SHAP baselines (default 100)",
+    )
+    parser.add_argument(
         "--atac-layer",
         choices=["counts_per_million", "tfidf", "log1p_cpm", "none"],
         help="ATAC normalization layer (default tfidf)",
@@ -215,6 +237,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             training.feature_importance_samples = args.feature_importance_samples
         if args.feature_importance_batch_size is not None:
             training.feature_importance_batch_size = args.feature_importance_batch_size
+        if args.disable_shap:
+            training.enable_shap = False
+        training.export_raw_predictions = args.export_raw_predictions
+        if args.shap_max_samples is not None:
+            training.shap_max_samples = args.shap_max_samples
+        if args.shap_background_samples is not None:
+            training.shap_background_samples = args.shap_background_samples
         if args.rf_n_estimators is not None:
             training.rf_n_estimators = args.rf_n_estimators
         if args.rf_max_depth is not None:

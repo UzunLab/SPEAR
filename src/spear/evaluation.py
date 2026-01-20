@@ -327,6 +327,204 @@ def _export_feature_importance_artifacts(
         end_ts,
     )
 
+
+def _export_shap_importance_artifacts(
+    output_dir: Path,
+    model_name: str,
+    shap_importances: np.ndarray,
+    feature_names: Sequence[str],
+    *,
+    method: Optional[str] = None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shap_values = np.asarray(shap_importances, dtype=np.float64)
+    if shap_values.size == 0 or shap_values.ndim != 1:
+        _LOG.info("SHAP export skipped | model=%s | reason=no values", model_name)
+        return
+
+    plot_feature_importance(
+        shap_values,
+        feature_names,
+        output_dir / "shap_importance_mean.png",
+        f"SHAP mean | {model_name.upper()}",
+        top_n=30,
+    )
+
+    # Parse feature metadata (same as feature importance export)
+    metadata_records = [_feature_name_metadata(name) for name in feature_names]
+    metadata_df = pd.DataFrame(metadata_records) if metadata_records else None
+
+    shap_df = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "shap_mean_abs": shap_values,
+        }
+    )
+
+    # Add metadata columns (TSS distance, gene name, etc.) if available
+    if metadata_df is not None and not metadata_df.empty:
+        shap_df = pd.concat([shap_df, metadata_df], axis=1)
+    shap_path = output_dir / "shap_importances_mean.csv"
+    shap_df.to_csv(shap_path, index=False)
+    _LOG.info("Saved SHAP mean importances (%d rows) to %s", shap_df.shape[0], shap_path)
+
+    def _extract_distance_kb(table: pd.DataFrame) -> tuple[Optional[pd.Series], Optional[str], bool]:
+        preferred_cols = [
+            "signed_distance_to_tss_kb",
+            "delta_to_tss_kb",
+            "distance_to_tss_kb",
+        ]
+        for col in preferred_cols:
+            if col in table.columns:
+                return pd.to_numeric(table[col], errors="coerce"), col, True
+
+        abs_cols = ["distance_to_tss_abs_kb"]
+        for col in abs_cols:
+            if col in table.columns:
+                return pd.to_numeric(table[col], errors="coerce"), col, False
+
+        bp_cols = ["delta_to_tss_bp", "distance_to_tss_bp", "relative_center_bp"]
+        for col in bp_cols:
+            if col in table.columns:
+                return pd.to_numeric(table[col], errors="coerce") / 1_000.0, col, True
+
+        return None, None, False
+
+    def _plot_shap_vs_tss_distance(
+        table: pd.DataFrame,
+        distance_kb: pd.Series,
+        output_path: Path,
+        title: str,
+        *,
+        max_distance_kb: float,
+        show_scatter: bool = False,
+        y_limits: Optional[tuple[float, float]] = None,
+    ) -> bool:
+        plot_df = pd.DataFrame(
+            {
+                "distance_kb": distance_kb,
+                "shap_value": pd.to_numeric(table["shap_mean_abs"], errors="coerce"),
+            }
+        )
+        plot_df = plot_df.replace([np.inf, -np.inf], np.nan).dropna()
+        if plot_df.empty:
+            return False
+        plot_df = plot_df[plot_df["distance_kb"].abs() <= max_distance_kb].copy()
+        if plot_df.empty:
+            return False
+        plot_df.sort_values("distance_kb", inplace=True)
+
+        per_bin = (
+            plot_df.groupby("distance_kb", sort=True)["shap_value"]
+            .quantile(0.9)
+            .reset_index()
+        )
+        if per_bin.empty:
+            return False
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig, ax = plt.subplots(figsize=(7.5, 4.8))
+        if show_scatter:
+            sns.scatterplot(
+                data=plot_df,
+                x="distance_kb",
+                y="shap_value",
+                s=30,
+                alpha=0.45,
+                edgecolor="none",
+                color="#4daf4a",
+                ax=ax,
+            )
+        ax.plot(
+            per_bin["distance_kb"],
+            per_bin["shap_value"],
+            color="#e41a1c",
+            linewidth=1.5,
+            label="90th percentile",
+        )
+        ax.legend(loc="upper right", frameon=True)
+        ax.axvline(0.0, color="#999999", linestyle="--", linewidth=1)
+        ax.set_xlim(-max_distance_kb, max_distance_kb)
+        if y_limits is not None:
+            ax.set_ylim(y_limits)
+        ax.set_xlabel("Distance to TSS (kb)")
+        ax.set_ylabel("Mean |SHAP|")
+        ax.set_title(title)
+        sns.despine(fig, left=True, bottom=True)
+        plt.tight_layout()
+        fig.savefig(output_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        return True
+
+    distance_kb, distance_col, distance_signed = _extract_distance_kb(shap_df)
+    distance_plot_path = output_dir / "shap_vs_tss.png"
+    distance_plot_zoomed_path = output_dir / "shap_vs_tss_zoomed.png"
+    if distance_kb is not None and distance_col is not None:
+        if not distance_signed:
+            _LOG.info(
+                "SHAP distance plot uses unsigned distances (%s); check feature metadata",
+                distance_col,
+            )
+        created = _plot_shap_vs_tss_distance(
+            shap_df,
+            distance_kb,
+            distance_plot_path,
+            f"SHAP vs TSS distance | {model_name.upper()}",
+            max_distance_kb=10.0,
+            show_scatter=True,
+        )
+        if created:
+            _LOG.info("Saved SHAP vs TSS plot to %s", distance_plot_path)
+        else:
+            distance_plot_path = None
+        zoom_df = pd.DataFrame(
+            {
+                "distance_kb": distance_kb,
+                "shap_value": pd.to_numeric(shap_df["shap_mean_abs"], errors="coerce"),
+            }
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+        zoom_df = zoom_df[zoom_df["distance_kb"].abs() <= 5.0]
+        if zoom_df.empty:
+            zoom_y_limits = None
+        else:
+            zoom_max = (
+                zoom_df.groupby("distance_kb", sort=True)["shap_value"]
+                .quantile(0.9)
+                .max()
+            )
+            zoom_y_limits = (0.0, float(zoom_max) * 1.15) if pd.notna(zoom_max) else None
+        zoomed = _plot_shap_vs_tss_distance(
+            shap_df,
+            distance_kb,
+            distance_plot_zoomed_path,
+            f"SHAP vs TSS distance (zoomed) | {model_name.upper()}",
+            max_distance_kb=5.0,
+            y_limits=zoom_y_limits,
+        )
+        if zoomed:
+            _LOG.info("Saved zoomed SHAP vs TSS plot to %s", distance_plot_zoomed_path)
+        else:
+            distance_plot_zoomed_path = None
+    else:
+        distance_plot_path = None
+        distance_plot_zoomed_path = None
+
+    summary = {
+        "model": model_name,
+        "method": method,
+        "num_features": int(shap_values.size),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "csv_path": str(shap_path),
+        "plot_path": str(output_dir / "shap_importance_mean.png"),
+    }
+    if distance_plot_path is not None:
+        summary["distance_plot_path"] = str(distance_plot_path)
+    if distance_plot_zoomed_path is not None:
+        summary["distance_plot_zoomed_path"] = str(distance_plot_zoomed_path)
+    summary_path = output_dir / "shap_importance_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
+    _LOG.info("Wrote SHAP summary manifest to %s", summary_path)
+
 try:
     import torch.nn as _torch_nn
 except ImportError:  # pragma: no cover - torch optional during some tests
@@ -920,8 +1118,14 @@ def _run_cellwise_pipeline(
                 model_export_meta[model_name]["failures"].append(str(exc))
             else:
                 model_dir = _ensure_directory(model_dir)
-                preds_df = _cellwise_predictions_dataframe(result)
-                preds_df.to_csv(model_dir / "predictions_raw.csv", index=False)
+                if not config.training.export_raw_predictions:
+                    _LOG.info(
+                        "Skipping raw predictions export | model=%s | reason=export_raw_predictions=False",
+                        model_name,
+                    )
+                else:
+                    preds_df = _cellwise_predictions_dataframe(result)
+                    preds_df.to_csv(model_dir / "predictions_raw.csv", index=False)
 
                 _write_cellwise_metrics(model_dir, result)
                 _plot_cellwise_diagnostics(model_dir, result)
@@ -938,7 +1142,7 @@ def _run_cellwise_pipeline(
                             title=f"{model_name.upper()} | {metric.title()}",
                         )
 
-                if getattr(result, "feature_importances", None) is not None and getattr(result, "feature_names", None):
+                if getattr(result, "feature_importances", None) is not None and getattr(result, "feature_names", None) is not None:
                     _export_feature_importance_artifacts(
                         model_dir,
                         model_name,
@@ -947,6 +1151,14 @@ def _run_cellwise_pipeline(
                         method=getattr(result, "feature_importance_method", None),
                         gene_names=result.gene_names,
                         feature_block_slices=getattr(result, "feature_block_slices", None),
+                    )
+                if getattr(result, "shap_importances_mean", None) is not None and getattr(result, "feature_names", None) is not None:
+                    _export_shap_importance_artifacts(
+                        model_dir,
+                        model_name,
+                        np.asarray(result.shap_importances_mean, dtype=np.float64),
+                        list(result.feature_names),
+                        method=getattr(result, "shap_importance_method", None),
                     )
 
                 metric_payload = {"model": model_name, "num_genes": dataset.num_genes()}
@@ -959,9 +1171,10 @@ def _run_cellwise_pipeline(
 
                 # Verify all critical files were written before logging completion
                 critical_files = [
-                    model_dir / "predictions_raw.csv",
                     model_dir / "metrics_aggregate.csv",
                 ]
+                if config.training.export_raw_predictions:
+                    critical_files.append(model_dir / "predictions_raw.csv")
                 all_files_exist = all(f.exists() for f in critical_files)
                 if all_files_exist:
                     _LOG.info(
